@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-module github.com/balacon/iceberg-go
+module github.com/apache/iceberg-go
 
 go 1.24
 

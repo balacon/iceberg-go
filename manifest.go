@@ -594,7 +594,7 @@ func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error)
 	if err != nil {
 		return nil, fmt.Errorf("manifest file's 'format-version' metadata is invalid: %w", err)
 	}
-	if formatVersion != file.Version() {
+	if file != nil && formatVersion != file.Version() {
 		return nil, fmt.Errorf("manifest file's 'format-version' metadata indicates version %d, but entry from manifest list indicates version %d",
 			formatVersion, file.Version())
 	}
@@ -609,7 +609,7 @@ func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error)
 		return nil, fmt.Errorf("manifest file's 'content' metadata is invalid, should be \"data\" or \"deletes\" but instead is %q",
 			contentStr)
 	}
-	if content != file.ManifestContent() {
+	if file != nil && content != file.ManifestContent() {
 		return nil, fmt.Errorf("manifest file's 'content' metadata indicates %q, but entry from manifest list indicates %q",
 			content.String(), file.ManifestContent().String())
 	}
@@ -682,6 +682,9 @@ func (c *ManifestReader) PartitionSpecID() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("manifest file's 'partition-spec-id' metadata is invalid: %w", err)
 	}
+	if c.file == nil {
+		return id, nil
+	}
 	if id != int(c.file.PartitionSpecID()) {
 		return 0, fmt.Errorf("manifest file's 'partition-spec-id' metadata indicates %d, but entry from manifest list indicates %d",
 			id, c.file.PartitionSpecID())
@@ -731,7 +734,9 @@ func (c *ManifestReader) ReadEntry() (ManifestEntry, error) {
 	if c.isFallback {
 		tmp = tmp.(*fallbackManifestEntry).toEntry()
 	}
-	tmp.inherit(c.file)
+	if c.file != nil {
+		tmp.Inherit(c.file)
+	}
 	if fieldToIDMap, ok := tmp.DataFile().(hasFieldToIDMap); ok {
 		fieldToIDMap.setFieldNameToIDMap(c.fieldNameToID)
 		fieldToIDMap.setFieldIDToLogicalTypeMap(c.fieldIDToType)
@@ -1690,7 +1695,7 @@ func (m *manifestEntry) FileSequenceNum() *int64 {
 
 func (m *manifestEntry) DataFile() DataFile { return m.Data }
 
-func (m *manifestEntry) inherit(manifest ManifestFile) {
+func (m *manifestEntry) Inherit(manifest ManifestFile) {
 	if m.Snapshot == nil {
 		snap := manifest.SnapshotID()
 		m.Snapshot = &snap
@@ -1985,7 +1990,7 @@ type ManifestEntry interface {
 	// by this manifest entry.
 	DataFile() DataFile
 
-	inherit(manifest ManifestFile)
+	Inherit(manifest ManifestFile)
 
 	wrap(status ManifestEntryStatus, snapshotID, seqNum, fileSeqNum *int64, datafile DataFile) ManifestEntry
 }

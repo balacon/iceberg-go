@@ -74,7 +74,7 @@ var (
 		{
 			EntryStatus: EntryStatusADDED,
 			Snapshot:    &entrySnapshotID,
-			Data: extendedDataFile{
+			Data: &extendedDataFile{
 				dataFileImm: &dataFileImm{
 					// bad value for Content but this field doesn't exist in V1
 					// so it shouldn't get written and shouldn't be read back out
@@ -200,7 +200,7 @@ var (
 		{
 			EntryStatus: EntryStatusADDED,
 			Snapshot:    &entrySnapshotID,
-			Data: extendedDataFile {
+			Data: &extendedDataFile {
 				dataFileImm: &dataFileImm{
 					Path:             "/home/iceberg/warehouse/nyc/taxis_partitioned/data/VendorID=1/00000-633-d8a4223e-dc97-45a1-86e1-adaba6e8abd7-00002.parquet",
 					Format:           ParquetFile,
@@ -337,7 +337,7 @@ var (
 		{
 			EntryStatus: EntryStatusADDED,
 			Snapshot:    &entrySnapshotID,
-			Data: extendedDataFile{
+			Data: &extendedDataFile{
 				dataFileImm: &dataFileImm{
 					Path:             dataRecord0.Path,
 					Format:           dataRecord0.Format,
@@ -359,7 +359,7 @@ var (
 		{
 			EntryStatus: EntryStatusADDED,
 			Snapshot:    &entrySnapshotID,
-			Data: extendedDataFile{
+			Data: &extendedDataFile{
 				dataFileImm: &dataFileImm{
 					Path:             dataRecord1.Path,
 					Format:           dataRecord1.Format,

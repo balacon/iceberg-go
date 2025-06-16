@@ -722,10 +722,10 @@ func (c *ManifestReader) ReadEntry() (ManifestEntry, error) {
 	var tmp ManifestEntry
 	if c.isFallback {
 		tmp = &fallbackManifestEntry{
-			manifestEntry: manifestEntry{Data: extendedDataFile{}},
+			manifestEntry: manifestEntry{Data: &extendedDataFile{}},
 		}
 	} else {
-		tmp = &manifestEntry{Data: extendedDataFile{}}
+		tmp = &manifestEntry{Data: &extendedDataFile{}}
 	}
 
 	if err := c.dec.Decode(tmp); err != nil {
@@ -1528,6 +1528,19 @@ type extendedDataFile struct {
 	specID   int32
 }
 
+func (e extendedDataFile) MarshalAvro() ([]byte, error) {
+	return avro.Marshal(nil, e.dataFileImm)
+}
+
+func (e *extendedDataFile) UnmarshalAvro(data []byte) error {
+	var inner dataFileImm
+	if err := avro.Unmarshal(nil, data, &inner); err != nil {
+		return err
+	}
+	e.dataFileImm = &inner
+	return nil
+}
+
 func (d *dataFileImm) initializeMapData() {
 	d.initMaps.Do(func() {
 		d.colSizeMap = avroColMapToMap(d.ColSizes)
@@ -1570,8 +1583,10 @@ func (d *dataFileImm) Count() int64         { return d.RecordCount }
 func (d *dataFileImm) FileSizeBytes() int64 { return d.FileSize }
 func (d extendedDataFile) SpecID() int32        { return d.specID }
 func (d extendedDataFile) WithSpecID(id int32) DataFile {
-	d.specID = id
-	return d
+	return &extendedDataFile{
+		dataFileImm: d.dataFileImm,
+		specID:      id,
+	}
 }
 
 func (d *dataFileImm) ColumnSizes() map[int]int64 {

@@ -1103,6 +1103,7 @@ func (*mockDataFile) SplitOffsets() []int64                     { return nil }
 func (*mockDataFile) EqualityFieldIDs() []int                   { return nil }
 func (*mockDataFile) SortOrderID() *int                         { return nil }
 func (m *mockDataFile) SpecID() int32                           { return m.specid }
+func (m *mockDataFile) WithSpecID(id int32) iceberg.DataFile    { m.specid = id; return m }
 
 type InclusiveMetricsTestSuite struct {
 	suite.Suite

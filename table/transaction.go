@@ -34,17 +34,17 @@ import (
 	"github.com/google/uuid"
 )
 
-type snapshotUpdate struct {
+type SnapshotUpdate struct {
 	txn           *Transaction
 	io            io.WriteFileIO
 	snapshotProps iceberg.Properties
 }
 
-func (s snapshotUpdate) fastAppend() *snapshotProducer {
+func (s SnapshotUpdate) fastAppend() *SnapshotProducer {
 	return newFastAppendFilesProducer(OpAppend, s.txn, s.io, nil, s.snapshotProps)
 }
 
-func (s snapshotUpdate) mergeOverwrite(commitUUID *uuid.UUID) *snapshotProducer {
+func (s SnapshotUpdate) mergeOverwrite(commitUUID *uuid.UUID) *SnapshotProducer {
 	op := OpOverwrite
 	if s.txn.meta.currentSnapshot() == nil {
 		op = OpAppend
@@ -53,9 +53,20 @@ func (s snapshotUpdate) mergeOverwrite(commitUUID *uuid.UUID) *snapshotProducer 
 	return newOverwriteFilesProducer(op, s.txn, s.io, commitUUID, s.snapshotProps)
 }
 
-func (s snapshotUpdate) mergeAppend() *snapshotProducer {
+func (s SnapshotUpdate) mergeAppend() *SnapshotProducer {
 	return newMergeAppendFilesProducer(OpAppend, s.txn, s.io, nil, s.snapshotProps)
 }
+
+func (s SnapshotUpdate) Custom(commitUUID *uuid.UUID, op Operation, f SnapshotProducerFactory) *SnapshotProducer {
+	return NewCustomSnapshotProducer(f, CustomSnapshotProducerOptions{
+		Op:              op,
+		Txn:             s.txn,
+		Fs:              s.io,
+		CommitUUID:      commitUUID,
+		SnapshotProps:   s.snapshotProps,
+	})
+}
+
 
 type Transaction struct {
 	tbl  *Table
@@ -67,7 +78,15 @@ type Transaction struct {
 	committed bool
 }
 
-func (t *Transaction) apply(updates []Update, reqs []Requirement) error {
+func (t *Transaction) Metadata() *MetadataBuilder {
+	return t.meta
+}
+
+func (t *Transaction) Table() *Table {
+	return t.tbl
+}
+
+func (t *Transaction) Apply(updates []Update, reqs []Requirement) error {
 	t.mx.Lock()
 	defer t.mx.Unlock()
 
@@ -116,9 +135,9 @@ func (t *Transaction) apply(updates []Update, reqs []Requirement) error {
 	return nil
 }
 
-func (t *Transaction) appendSnapshotProducer(props iceberg.Properties) *snapshotProducer {
+func (t *Transaction) appendSnapshotProducer(props iceberg.Properties) *SnapshotProducer {
 	manifestMerge := t.meta.props.GetBool(ManifestMergeEnabledKey, ManifestMergeEnabledDefault)
-	updateSnapshot := t.updateSnapshot(props)
+	updateSnapshot := t.UpdateSnapshot(props)
 	if manifestMerge {
 		return updateSnapshot.mergeAppend()
 	}
@@ -126,8 +145,8 @@ func (t *Transaction) appendSnapshotProducer(props iceberg.Properties) *snapshot
 	return updateSnapshot.fastAppend()
 }
 
-func (t *Transaction) updateSnapshot(props iceberg.Properties) snapshotUpdate {
-	return snapshotUpdate{
+func (t *Transaction) UpdateSnapshot(props iceberg.Properties) SnapshotUpdate {
+	return SnapshotUpdate{
 		txn:           t,
 		io:            t.tbl.fs.(io.WriteFileIO),
 		snapshotProps: props,
@@ -136,7 +155,7 @@ func (t *Transaction) updateSnapshot(props iceberg.Properties) snapshotUpdate {
 
 func (t *Transaction) SetProperties(props iceberg.Properties) error {
 	if len(props) > 0 {
-		return t.apply([]Update{NewSetPropertiesUpdate(props)}, nil)
+		return t.Apply([]Update{NewSetPropertiesUpdate(props)}, nil)
 	}
 
 	return nil
@@ -163,15 +182,15 @@ func (t *Transaction) Append(ctx context.Context, rdr array.RecordReader, snapsh
 		if err != nil {
 			return err
 		}
-		appendFiles.appendDataFile(df)
+		appendFiles.AppendDataFile(df)
 	}
 
-	updates, reqs, err := appendFiles.commit()
+	updates, reqs, err := appendFiles.Commit()
 	if err != nil {
 		return err
 	}
 
-	return t.apply(updates, reqs)
+	return t.Apply(updates, reqs)
 }
 
 // ReplaceFiles is actually just an overwrite operation with multiple
@@ -247,10 +266,10 @@ func (t *Transaction) ReplaceDataFiles(ctx context.Context, filesToDelete, files
 	}
 
 	commitUUID := uuid.New()
-	updater := t.updateSnapshot(snapshotProps).mergeOverwrite(&commitUUID)
+	updater := t.UpdateSnapshot(snapshotProps).mergeOverwrite(&commitUUID)
 
 	for _, df := range markedForDeletion {
-		updater.deleteDataFile(df)
+		updater.DeleteDataFile(df)
 	}
 
 	dataFiles := filesToDataFiles(ctx, t.tbl.fs, t.meta, slices.Values(filesToAdd))
@@ -258,15 +277,15 @@ func (t *Transaction) ReplaceDataFiles(ctx context.Context, filesToDelete, files
 		if err != nil {
 			return err
 		}
-		updater.appendDataFile(df)
+		updater.AppendDataFile(df)
 	}
 
-	updates, reqs, err := updater.commit()
+	updates, reqs, err := updater.Commit()
 	if err != nil {
 		return err
 	}
 
-	return t.apply(updates, reqs)
+	return t.Apply(updates, reqs)
 }
 
 func (t *Transaction) AddFiles(ctx context.Context, files []string, snapshotProps iceberg.Properties, ignoreDuplicates bool) error {
@@ -309,22 +328,22 @@ func (t *Transaction) AddFiles(ctx context.Context, files []string, snapshotProp
 		}
 	}
 
-	updater := t.updateSnapshot(snapshotProps).fastAppend()
+	updater := t.UpdateSnapshot(snapshotProps).fastAppend()
 
 	dataFiles := filesToDataFiles(ctx, t.tbl.fs, t.meta, slices.Values(files))
 	for df, err := range dataFiles {
 		if err != nil {
 			return err
 		}
-		updater.appendDataFile(df)
+		updater.AppendDataFile(df)
 	}
 
-	updates, reqs, err := updater.commit()
+	updates, reqs, err := updater.Commit()
 	if err != nil {
 		return err
 	}
 
-	return t.apply(updates, reqs)
+	return t.Apply(updates, reqs)
 }
 
 func (t *Transaction) Scan(opts ...ScanOption) (*Scan, error) {

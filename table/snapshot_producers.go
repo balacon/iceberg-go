@@ -39,12 +39,12 @@ type producerImpl interface {
 	// to the new snapshot. This will be called as the last step
 	// before writing a manifest list file, using the result of this function
 	// as the final list of manifests to write.
-	processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error)
+	ProcessManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error)
 	// perform any processing necessary and return the list of existing
 	// manifests that should be included in the snapshot
-	existingManifests() ([]iceberg.ManifestFile, error)
+	ExistingManifests() ([]iceberg.ManifestFile, error)
 	// return the deleted entries for writing delete file manifests
-	deletedEntries() ([]iceberg.ManifestEntry, error)
+	DeletedEntries() ([]iceberg.ManifestEntry, error)
 }
 
 func newManifestFileName(num int, commit uuid.UUID) string {
@@ -68,11 +68,11 @@ type fastAppendFiles struct {
 	base *snapshotProducer
 }
 
-func (fa *fastAppendFiles) processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
+func (fa *fastAppendFiles) ProcessManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
 	return manifests, nil
 }
 
-func (fa *fastAppendFiles) existingManifests() ([]iceberg.ManifestFile, error) {
+func (fa *fastAppendFiles) ExistingManifests() ([]iceberg.ManifestFile, error) {
 	existing := make([]iceberg.ManifestFile, 0)
 	if fa.base.parentSnapshotID > 0 {
 		previous, err := fa.base.txn.meta.SnapshotByID(fa.base.parentSnapshotID)
@@ -95,7 +95,7 @@ func (fa *fastAppendFiles) existingManifests() ([]iceberg.ManifestFile, error) {
 	return existing, nil
 }
 
-func (fa *fastAppendFiles) deletedEntries() ([]iceberg.ManifestEntry, error) {
+func (fa *fastAppendFiles) DeletedEntries() ([]iceberg.ManifestEntry, error) {
 	// for fast appends, there are no deleted entries
 	return nil, nil
 }
@@ -111,12 +111,12 @@ func newOverwriteFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFil
 	return prod
 }
 
-func (of *overwriteFiles) processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
+func (of *overwriteFiles) ProcessManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
 	// no post processing
 	return manifests, nil
 }
 
-func (of *overwriteFiles) existingManifests() ([]iceberg.ManifestFile, error) {
+func (of *overwriteFiles) ExistingManifests() ([]iceberg.ManifestFile, error) {
 	// determine if there are any existing manifest files
 	existingFiles := make([]iceberg.ManifestFile, 0)
 
@@ -188,7 +188,7 @@ func (of *overwriteFiles) existingManifests() ([]iceberg.ManifestFile, error) {
 	return existingFiles, nil
 }
 
-func (of *overwriteFiles) deletedEntries() ([]iceberg.ManifestEntry, error) {
+func (of *overwriteFiles) DeletedEntries() ([]iceberg.ManifestEntry, error) {
 	// determine if we need to record any deleted entries
 	//
 	// with a full overwrite all the entries are considered deleted
@@ -385,7 +385,7 @@ func newMergeAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteF
 	return prod
 }
 
-func (m *mergeAppendFiles) processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
+func (m *mergeAppendFiles) ProcessManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
 	unmergedDataManifests, unmergedDeleteManifests := []iceberg.ManifestFile{}, []iceberg.ManifestFile{}
 	for _, m := range manifests {
 		if m.ManifestContent() == iceberg.ManifestContentData {
@@ -555,7 +555,7 @@ func (sp *snapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 		})
 	}
 
-	deleted, err := sp.deletedEntries()
+	deleted, err := sp.DeletedEntries()
 	if err != nil {
 		return nil, err
 	}
@@ -590,7 +590,7 @@ func (sp *snapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 	}
 
 	g.Go(func() error {
-		m, err := sp.existingManifests()
+		m, err := sp.ExistingManifests()
 		if err != nil {
 			return err
 		}
@@ -605,7 +605,7 @@ func (sp *snapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 
 	manifests := slices.Concat(results[0], results[1], results[2])
 
-	return sp.processManifests(manifests)
+	return sp.ProcessManifests(manifests)
 }
 
 func (sp *snapshotProducer) summary(props iceberg.Properties) (Summary, error) {

@@ -34,17 +34,17 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type ProducerImpl interface {
+type producerImpl interface {
 	// to perform any post-processing on the manifests before writing them
 	// to the new snapshot. This will be called as the last step
 	// before writing a manifest list file, using the result of this function
 	// as the final list of manifests to write.
-	ProcessManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error)
+	processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error)
 	// perform any processing necessary and return the list of existing
 	// manifests that should be included in the snapshot
-	ExistingManifests() ([]iceberg.ManifestFile, error)
+	existingManifests() ([]iceberg.ManifestFile, error)
 	// return the deleted entries for writing delete file manifests
-	DeletedEntries() ([]iceberg.ManifestEntry, error)
+	deletedEntries() ([]iceberg.ManifestEntry, error)
 }
 
 func newManifestFileName(num int, commit uuid.UUID) string {
@@ -57,22 +57,22 @@ func newManifestListFileName(snapshotID int64, attempt int, commit uuid.UUID) st
 	return fmt.Sprintf("snap-%d-%d-%s.avro", snapshotID, attempt, commit)
 }
 
-func newFastAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *SnapshotProducer {
+func newFastAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
 	prod := createSnapshotProducer(op, txn, fs, commitUUID, snapshotProps)
-	prod.ProducerImpl = &fastAppendFiles{base: prod}
+	prod.producerImpl = &fastAppendFiles{base: prod}
 
 	return prod
 }
 
 type fastAppendFiles struct {
-	base *SnapshotProducer
+	base *snapshotProducer
 }
 
-func (fa *fastAppendFiles) ProcessManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
+func (fa *fastAppendFiles) processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
 	return manifests, nil
 }
 
-func (fa *fastAppendFiles) ExistingManifests() ([]iceberg.ManifestFile, error) {
+func (fa *fastAppendFiles) existingManifests() ([]iceberg.ManifestFile, error) {
 	existing := make([]iceberg.ManifestFile, 0)
 	if fa.base.parentSnapshotID > 0 {
 		previous, err := fa.base.txn.meta.SnapshotByID(fa.base.parentSnapshotID)
@@ -95,44 +95,28 @@ func (fa *fastAppendFiles) ExistingManifests() ([]iceberg.ManifestFile, error) {
 	return existing, nil
 }
 
-func (fa *fastAppendFiles) DeletedEntries() ([]iceberg.ManifestEntry, error) {
+func (fa *fastAppendFiles) deletedEntries() ([]iceberg.ManifestEntry, error) {
 	// for fast appends, there are no deleted entries
 	return nil, nil
 }
 
 type overwriteFiles struct {
-	base *SnapshotProducer
+	base *snapshotProducer
 }
 
-func newOverwriteFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *SnapshotProducer {
+func newOverwriteFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
 	prod := createSnapshotProducer(op, txn, fs, commitUUID, snapshotProps)
-	prod.ProducerImpl = &overwriteFiles{base: prod}
+	prod.producerImpl = &overwriteFiles{base: prod}
 
 	return prod
 }
 
-type CustomSnapshotProducerOptions struct {
-	Op               Operation
-	Txn              *Transaction
-	Fs               iceio.WriteFileIO
-	CommitUUID       *uuid.UUID
-	SnapshotProps    iceberg.Properties
-}
-
-type SnapshotProducerFactory = func(base *SnapshotProducer, opts CustomSnapshotProducerOptions) *SnapshotProducer
-
-func NewCustomSnapshotProducer(f SnapshotProducerFactory, opts CustomSnapshotProducerOptions) *SnapshotProducer {
-	prod := createSnapshotProducer(opts.Op, opts.Txn, opts.Fs, opts.CommitUUID, opts.SnapshotProps)
-	prod.ProducerImpl = f(prod, opts)
-	return prod
-}
-
-func (of *overwriteFiles) ProcessManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
+func (of *overwriteFiles) processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
 	// no post processing
 	return manifests, nil
 }
 
-func (of *overwriteFiles) ExistingManifests() ([]iceberg.ManifestFile, error) {
+func (of *overwriteFiles) existingManifests() ([]iceberg.ManifestFile, error) {
 	// determine if there are any existing manifest files
 	existingFiles := make([]iceberg.ManifestFile, 0)
 
@@ -204,7 +188,7 @@ func (of *overwriteFiles) ExistingManifests() ([]iceberg.ManifestFile, error) {
 	return existingFiles, nil
 }
 
-func (of *overwriteFiles) DeletedEntries() ([]iceberg.ManifestEntry, error) {
+func (of *overwriteFiles) deletedEntries() ([]iceberg.ManifestEntry, error) {
 	// determine if we need to record any deleted entries
 	//
 	// with a full overwrite all the entries are considered deleted
@@ -261,7 +245,7 @@ type manifestMergeManager struct {
 	targetSizeBytes int
 	minCountToMerge int
 	mergeEnabled    bool
-	snap            *SnapshotProducer
+	snap            *snapshotProducer
 }
 
 func (m *manifestMergeManager) groupBySpec(manifests []iceberg.ManifestFile) map[int][]iceberg.ManifestFile {
@@ -276,7 +260,7 @@ func (m *manifestMergeManager) groupBySpec(manifests []iceberg.ManifestFile) map
 }
 
 func (m *manifestMergeManager) createManifest(specID int, bin []iceberg.ManifestFile) (iceberg.ManifestFile, error) {
-	wr, path, counter, err := m.snap.newManifestWriter(m.snap.Spec(specID))
+	wr, path, counter, err := m.snap.newManifestWriter(m.snap.spec(specID))
 	if err != nil {
 		return nil, err
 	}
@@ -389,9 +373,9 @@ type mergeAppendFiles struct {
 	mergeEnabled    bool
 }
 
-func newMergeAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *SnapshotProducer {
+func newMergeAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
 	prod := createSnapshotProducer(op, txn, fs, commitUUID, snapshotProps)
-	prod.ProducerImpl = &mergeAppendFiles{
+	prod.producerImpl = &mergeAppendFiles{
 		fastAppendFiles: fastAppendFiles{base: prod},
 		targetSizeBytes: txn.meta.props.GetInt(ManifestTargetSizeBytesKey, ManifestTargetSizeBytesDefault),
 		minCountToMerge: txn.meta.props.GetInt(ManifestMinMergeCountKey, ManifestMinMergeCountDefault),
@@ -401,7 +385,7 @@ func newMergeAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteF
 	return prod
 }
 
-func (m *mergeAppendFiles) ProcessManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
+func (m *mergeAppendFiles) processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
 	unmergedDataManifests, unmergedDeleteManifests := []iceberg.ManifestFile{}, []iceberg.ManifestFile{}
 	for _, m := range manifests {
 		if m.ManifestContent() == iceberg.ManifestContentData {
@@ -426,8 +410,8 @@ func (m *mergeAppendFiles) ProcessManifests(manifests []iceberg.ManifestFile) ([
 	return append(result, unmergedDeleteManifests...), nil
 }
 
-type SnapshotProducer struct {
-	ProducerImpl
+type snapshotProducer struct {
+	producerImpl
 
 	commitUuid       uuid.UUID
 	io               iceio.WriteFileIO
@@ -441,7 +425,7 @@ type SnapshotProducer struct {
 	snapshotProps    iceberg.Properties
 }
 
-func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *SnapshotProducer {
+func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
 	var (
 		commit         uuid.UUID
 		parentSnapshot int64 = -1
@@ -457,7 +441,7 @@ func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO
 		parentSnapshot = snap.SnapshotID
 	}
 
-	return &SnapshotProducer{
+	return &snapshotProducer{
 		commitUuid:       commit,
 		io:               fs,
 		txn:              txn,
@@ -470,7 +454,7 @@ func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO
 	}
 }
 
-func (sp *SnapshotProducer) Spec(id int) iceberg.PartitionSpec {
+func (sp *snapshotProducer) spec(id int) iceberg.PartitionSpec {
 	if spec, _ := sp.txn.meta.GetSpecByID(id); spec != nil {
 		return *spec
 	}
@@ -478,19 +462,19 @@ func (sp *SnapshotProducer) Spec(id int) iceberg.PartitionSpec {
 	return iceberg.NewPartitionSpec()
 }
 
-func (sp *SnapshotProducer) AppendDataFile(df iceberg.DataFile) *SnapshotProducer {
+func (sp *snapshotProducer) appendDataFile(df iceberg.DataFile) *snapshotProducer {
 	sp.addedFiles = append(sp.addedFiles, df)
 
 	return sp
 }
 
-func (sp *SnapshotProducer) DeleteDataFile(df iceberg.DataFile) *SnapshotProducer {
+func (sp *snapshotProducer) deleteDataFile(df iceberg.DataFile) *snapshotProducer {
 	sp.deletedFiles[df.FilePath()] = df
 
 	return sp
 }
 
-func (sp *SnapshotProducer) newManifestWriter(spec iceberg.PartitionSpec) (*iceberg.ManifestWriter, string, *internal.CountingWriter, error) {
+func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec) (*iceberg.ManifestWriter, string, *internal.CountingWriter, error) {
 	out, path, err := sp.newManifestOutput()
 	if err != nil {
 		return nil, "", nil, err
@@ -508,7 +492,7 @@ func (sp *SnapshotProducer) newManifestWriter(spec iceberg.PartitionSpec) (*iceb
 	return wr, path, counter, nil
 }
 
-func (sp *SnapshotProducer) newManifestOutput() (io.WriteCloser, string, error) {
+func (sp *snapshotProducer) newManifestOutput() (io.WriteCloser, string, error) {
 	provider, err := sp.txn.tbl.LocationProvider()
 	if err != nil {
 		return nil, "", err
@@ -523,11 +507,11 @@ func (sp *SnapshotProducer) newManifestOutput() (io.WriteCloser, string, error) 
 	return f, filepath, nil
 }
 
-func (sp *SnapshotProducer) fetchManifestEntry(m iceberg.ManifestFile, discardDeleted bool) ([]iceberg.ManifestEntry, error) {
+func (sp *snapshotProducer) fetchManifestEntry(m iceberg.ManifestFile, discardDeleted bool) ([]iceberg.ManifestEntry, error) {
 	return m.FetchEntries(sp.io, discardDeleted)
 }
 
-func (sp *SnapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
+func (sp *snapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 	var g errgroup.Group
 
 	results := [...][]iceberg.ManifestFile{nil, nil, nil}
@@ -571,7 +555,7 @@ func (sp *SnapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 		})
 	}
 
-	deleted, err := sp.DeletedEntries()
+	deleted, err := sp.deletedEntries()
 	if err != nil {
 		return nil, err
 	}
@@ -594,7 +578,7 @@ func (sp *SnapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 				defer out.Close()
 
 				mf, err := iceberg.WriteManifest(path, out, sp.txn.meta.formatVersion,
-					sp.Spec(specid), sp.txn.meta.CurrentSchema(), sp.snapshotID, entries)
+					sp.spec(specid), sp.txn.meta.CurrentSchema(), sp.snapshotID, entries)
 				if err != nil {
 					return err
 				}
@@ -606,7 +590,7 @@ func (sp *SnapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 	}
 
 	g.Go(func() error {
-		m, err := sp.ExistingManifests()
+		m, err := sp.existingManifests()
 		if err != nil {
 			return err
 		}
@@ -621,10 +605,10 @@ func (sp *SnapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 
 	manifests := slices.Concat(results[0], results[1], results[2])
 
-	return sp.ProcessManifests(manifests)
+	return sp.processManifests(manifests)
 }
 
-func (sp *SnapshotProducer) Summary(props iceberg.Properties) (Summary, error) {
+func (sp *snapshotProducer) summary(props iceberg.Properties) (Summary, error) {
 	var ssc SnapshotSummaryCollector
 	partitionSummaryLimit := sp.txn.meta.props.
 		GetInt(WritePartitionSummaryLimitKey, WritePartitionSummaryLimitDefault)
@@ -662,14 +646,14 @@ func (sp *SnapshotProducer) Summary(props iceberg.Properties) (Summary, error) {
 	}, previousSummary)
 }
 
-func (sp *SnapshotProducer) Commit() ([]Update, []Requirement, error) {
+func (sp *snapshotProducer) commit() ([]Update, []Requirement, error) {
 	newManifests, err := sp.manifests()
 	if err != nil {
 		return nil, nil, err
 	}
 
 	nextSequence := sp.txn.meta.nextSequenceNumber()
-	summary, err := sp.Summary(sp.snapshotProps)
+	summary, err := sp.summary(sp.snapshotProps)
 	if err != nil {
 		return nil, nil, err
 	}

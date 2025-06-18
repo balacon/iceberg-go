@@ -441,26 +441,6 @@ type SnapshotProducer struct {
 	snapshotProps    iceberg.Properties
 }
 
-func (sp *SnapshotProducer) Transaction() *Transaction {
-	return sp.txn
-}
-
-func (sp *SnapshotProducer) CommitUUID() uuid.UUID {
-	return sp.commitUuid
-}
-
-func (sp *SnapshotProducer) SnapshotID() int64 {
-	return sp.snapshotID
-}
-
-func (sp *SnapshotProducer) Operation() Operation {
-	return sp.op
-}
-
-func (sp *SnapshotProducer) ParentSnapshotID() int64 {
-	return sp.parentSnapshotID
-}
-
 func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *SnapshotProducer {
 	var (
 		commit         uuid.UUID

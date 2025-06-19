@@ -235,8 +235,11 @@ func (d *DataFileStatistics) PartitionValue(field iceberg.PartitionField, sc *ic
 }
 
 func (d *DataFileStatistics) ToDataFile(schema *iceberg.Schema, spec iceberg.PartitionSpec, path string, format iceberg.FileFormat, filesize int64) iceberg.DataFile {
-	var fieldIDToPartitionData map[int]any
-	if !spec.Equals(*iceberg.UnpartitionedSpec) {
+	return d.ToDataFile2(schema, spec, path, format, filesize, nil)
+}
+
+func (d *DataFileStatistics) ToDataFile2(schema *iceberg.Schema, spec iceberg.PartitionSpec, path string, format iceberg.FileFormat, filesize int64, fieldIDToPartitionData map[int]any) iceberg.DataFile {
+	if !spec.Equals(*iceberg.UnpartitionedSpec) && len(fieldIDToPartitionData) == 0 {
 		fieldIDToPartitionData = make(map[int]any)
 		for field := range spec.Fields() {
 			val := d.PartitionValue(field, schema)

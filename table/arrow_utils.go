@@ -1178,6 +1178,10 @@ func computeStatsPlan(sc *iceberg.Schema, props iceberg.Properties) (map[int]tbl
 }
 
 func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilder, paths iter.Seq[string]) iter.Seq2[iceberg.DataFile, error] {
+	return FilesToDataFiles(ctx, fileIO, meta, paths, nil)
+}
+
+func FilesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilder, paths iter.Seq[string], fieldIDToPartitionData map[int]any) iter.Seq2[iceberg.DataFile, error] {
 	return func(yield func(iceberg.DataFile, error) bool) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1215,7 +1219,7 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 			statistics := format.DataFileStatsFromMeta(rdr.Metadata(), must(computeStatsPlan(currentSchema, meta.props)),
 				must(format.PathToIDMapping(currentSchema)))
 
-			df := statistics.ToDataFile(currentSchema, currentSpec, filePath, iceberg.ParquetFile, rdr.SourceFileSize())
+			df := statistics.ToDataFile2(currentSchema, currentSpec, filePath, iceberg.ParquetFile, rdr.SourceFileSize(), fieldIDToPartitionData)
 			if !yield(df, nil) {
 				return
 			}

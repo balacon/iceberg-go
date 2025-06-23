@@ -423,9 +423,16 @@ type snapshotProducer struct {
 	manifestCount    atomic.Int32
 	deletedFiles     map[string]iceberg.DataFile
 	snapshotProps    iceberg.Properties
+	branch 		     string	
 }
 
 func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
+	return CreateBranchSnapshotProducer(
+		"", op, txn, fs, commitUUID, snapshotProps,
+	)
+}
+
+func CreateBranchSnapshotProducer(branch string, op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
 	var (
 		commit         uuid.UUID
 		parentSnapshot int64 = -1
@@ -437,7 +444,11 @@ func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO
 		commit = *commitUUID
 	}
 
-	if snap := txn.meta.currentSnapshot(); snap != nil {
+	if len(branch) == 0 {
+		branch = "main"
+	}
+
+	if snap := txn.meta.SnapshotByName(branch); snap != nil {
 		parentSnapshot = snap.SnapshotID
 	}
 
@@ -451,6 +462,7 @@ func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO
 		addedFiles:       []iceberg.DataFile{},
 		deletedFiles:     make(map[string]iceberg.DataFile),
 		snapshotProps:    snapshotProps,
+		branch:           branch,
 	}
 }
 
@@ -695,8 +707,8 @@ func (sp *snapshotProducer) commit() ([]Update, []Requirement, error) {
 
 	return []Update{
 			NewAddSnapshotUpdate(&snapshot),
-			NewSetSnapshotRefUpdate("main", sp.snapshotID, BranchRef, -1, -1, -1),
+			NewSetSnapshotRefUpdate(sp.branch, sp.snapshotID, BranchRef, -1, -1, -1),
 		}, []Requirement{
-			AssertRefSnapshotID("main", sp.txn.meta.currentSnapshotID),
+			AssertRefSnapshotID(sp.branch, sp.txn.meta.currentSnapshotID),
 		}, nil
 }

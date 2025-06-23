@@ -667,6 +667,18 @@ func (b *MetadataBuilder) GetSortOrderByID(id int) (*SortOrder, error) {
 	return nil, fmt.Errorf("sort order with id %d not found", id)
 }
 
+func (b *MetadataBuilder) SnapshotByName(name string) *Snapshot {
+	ref, ok := b.refs[name]
+	if !ok {
+		return nil
+	}
+	snap, err := b.SnapshotByID(ref.SnapshotID)
+	if err != nil {
+		return nil
+	}
+	return snap
+}
+
 func (b *MetadataBuilder) SnapshotByID(id int64) (*Snapshot, error) {
 	for _, s := range b.snapshotList {
 		if s.SnapshotID == id {

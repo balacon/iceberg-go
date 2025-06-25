@@ -705,10 +705,15 @@ func (sp *snapshotProducer) commit() ([]Update, []Requirement, error) {
 		TimestampMs:      time.Now().UnixMilli(),
 	}
 
+	var branchCurrentSnapshotID *int64
+	if bs := sp.txn.meta.SnapshotByName(sp.branch); bs != nil {
+		branchCurrentSnapshotID = &bs.SnapshotID
+	}
+
 	return []Update{
 			NewAddSnapshotUpdate(&snapshot),
 			NewSetSnapshotRefUpdate(sp.branch, sp.snapshotID, BranchRef, -1, -1, -1),
 		}, []Requirement{
-			AssertRefSnapshotID(sp.branch, sp.txn.meta.currentSnapshotID),
+			AssertRefSnapshotID(sp.branch, branchCurrentSnapshotID),
 		}, nil
 }

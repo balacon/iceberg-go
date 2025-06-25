@@ -571,7 +571,6 @@ func (b *MetadataBuilder) SetSnapshotRef(
 	}
 
 	if name == MainBranch {
-		b.updates = append(b.updates, NewSetSnapshotRefUpdate(name, snapshotID, refType, maxRefAgeMs, maxSnapshotAgeMs, minSnapshotsToKeep))
 		b.currentSnapshotID = &snapshotID
 		if !isAddedSnapshot {
 			b.lastUpdatedMS = time.Now().Local().UnixMilli()
@@ -581,12 +580,7 @@ func (b *MetadataBuilder) SetSnapshotRef(
 			TimestampMs: b.lastUpdatedMS,
 		})
 	}
-
-	if slices.ContainsFunc(b.updates, func(u Update) bool {
-		return u.Action() == UpdateAddSnapshot && u.(*addSnapshotUpdate).Snapshot.SnapshotID == snapshotID
-	}) {
-		b.lastUpdatedMS = snapshot.TimestampMs
-	}
+	b.updates = append(b.updates, NewSetSnapshotRefUpdate(name, snapshotID, refType, maxRefAgeMs, maxSnapshotAgeMs, minSnapshotsToKeep))
 
 	b.refs[name] = ref
 

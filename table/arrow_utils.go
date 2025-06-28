@@ -1178,10 +1178,18 @@ func computeStatsPlan(sc *iceberg.Schema, props iceberg.Properties) (map[int]tbl
 }
 
 func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilder, paths iter.Seq[string]) iter.Seq2[iceberg.DataFile, error] {
-	return FilesToDataFiles(ctx, fileIO, meta, paths, nil)
+	return FilesToDataFiles(ctx, fileIO, meta.CurrentSpec(), meta.CurrentSchema(), meta.props, paths, nil)
 }
 
-func FilesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilder, paths iter.Seq[string], fieldIDToPartitionData map[int]any) iter.Seq2[iceberg.DataFile, error] {
+func FilesToDataFiles(
+	ctx context.Context,
+	fileIO iceio.IO,
+	spec iceberg.PartitionSpec,
+	schema *iceberg.Schema,
+	tblProps iceberg.Properties,
+	paths iter.Seq[string],
+	fieldIDToPartitionData map[int]any,
+) iter.Seq2[iceberg.DataFile, error] {
 	return func(yield func(iceberg.DataFile, error) bool) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1194,7 +1202,7 @@ func FilesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 			}
 		}()
 
-		currentSchema, currentSpec := meta.CurrentSchema(), meta.CurrentSpec()
+		currentSchema, currentSpec := schema, spec
 
 		for filePath := range paths {
 			format := tblutils.FormatFromFileName(filePath)
@@ -1216,7 +1224,7 @@ func FilesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 				return
 			}
 
-			statistics := format.DataFileStatsFromMeta(rdr.Metadata(), must(computeStatsPlan(currentSchema, meta.props)),
+			statistics := format.DataFileStatsFromMeta(rdr.Metadata(), must(computeStatsPlan(currentSchema, tblProps)),
 				must(format.PathToIDMapping(currentSchema)))
 
 			df := statistics.ToDataFile2(currentSchema, currentSpec, filePath, iceberg.ParquetFile, rdr.SourceFileSize(), fieldIDToPartitionData)

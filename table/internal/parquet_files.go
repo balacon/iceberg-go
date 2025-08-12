@@ -414,6 +414,10 @@ func (p parquetFormat) DataFileStatsFromMeta(meta Metadata, statsCols map[int]St
 	for rg := range pqmeta.NumRowGroups() {
 		// reference: https://github.com/apache/iceberg-python/blob/main/pyiceberg/io/pyarrow.py#L2285
 		rowGroup := pqmeta.RowGroup(rg)
+		if rowGroup.NumRows() == 0 {
+			// skip empty row groups
+			continue
+		}
 		colChunk, err := rowGroup.ColumnChunk(0)
 		if err != nil {
 			panic(err)

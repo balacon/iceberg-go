@@ -704,6 +704,14 @@ func (b *MetadataBuilder) TrimMetadataLogs(maxEntries int) *MetadataBuilder {
 	return b
 }
 
+func (b *MetadataBuilder) MetadataLogToTrim(maxEntries int) []MetadataLogEntry {
+	if len(b.metadataLog) <= maxEntries {
+		return nil
+	}
+
+	return slices.Clone(b.metadataLog[:len(b.metadataLog)-maxEntries])
+}
+
 func (b *MetadataBuilder) AppendMetadataLog(entry MetadataLogEntry) *MetadataBuilder {
 	b.metadataLog = append(b.metadataLog, entry)
 

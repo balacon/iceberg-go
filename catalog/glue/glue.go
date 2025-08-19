@@ -24,6 +24,7 @@ import (
 	"iter"
 	"maps"
 	"strconv"
+	"strings"
 	_ "unsafe"
 
 	"github.com/apache/iceberg-go"
@@ -42,10 +43,9 @@ import (
 const (
 	// Use the same conventions as in the pyiceberg project.
 	// See: https://github.com/apache/iceberg-python/blob/main/pyiceberg/catalog/__init__.py#L82-L96
-	glueTypeIceberg      = "ICEBERG"
-	databaseTypePropsKey = "database_type"
-	tableTypePropsKey    = "table_type"
-	descriptionPropsKey  = "Description"
+	glueTypeIceberg     = "ICEBERG"
+	tableTypePropsKey   = "table_type"
+	descriptionPropsKey = "Description"
 
 	// Database location.
 	locationPropsKey = "Location"
@@ -223,13 +223,14 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 	}
 
 	ctx = utils.WithAwsConfig(ctx, c.awsCfg)
-	// TODO: consider providing a way to directly access the S3 iofs to enable testing of the catalog.
-	iofs, err := io.LoadFS(ctx, props, location)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load table %s.%s: %w", database, tableName, err)
-	}
 
-	icebergTable, err := table.NewFromLocation(identifier, location, iofs, c)
+	icebergTable, err := table.NewFromLocation(
+		ctx,
+		identifier,
+		location,
+		io.LoadFSFunc(props, location),
+		c,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create table from location %s.%s: %w", database, tableName, err)
 	}
@@ -255,7 +256,11 @@ func (c *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, 
 		return nil, err
 	}
 
-	wfs, ok := staged.FS().(io.WriteFileIO)
+	afs, err := staged.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	wfs, ok := afs.(io.WriteFileIO)
 	if !ok {
 		return nil, errors.New("loaded filesystem IO does not support writing")
 	}
@@ -317,12 +322,14 @@ func (c *Catalog) RegisterTable(ctx context.Context, identifier table.Identifier
 	}
 	// Load the metadata file to get table properties
 	ctx = utils.WithAwsConfig(ctx, c.awsCfg)
-	iofs, err := io.LoadFS(ctx, nil, metadataLocation)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load metadata file at %s: %w", metadataLocation, err)
-	}
 	// Read the metadata file
-	metadata, err := table.NewFromLocation([]string{tableName}, metadataLocation, iofs, c)
+	metadata, err := table.NewFromLocation(
+		ctx,
+		[]string{tableName},
+		metadataLocation,
+		io.LoadFSFunc(nil, metadataLocation),
+		c,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read table metadata from %s: %w", metadataLocation, err)
 	}
@@ -511,10 +518,7 @@ func (c *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifie
 		return err
 	}
 
-	databaseParameters := map[string]string{
-		databaseTypePropsKey: glueTypeIceberg,
-	}
-
+	databaseParameters := map[string]string{}
 	description := props[descriptionPropsKey]
 	locationURI := props[locationPropsKey]
 
@@ -650,20 +654,16 @@ func (c *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) (
 
 	var icebergNamespaces []table.Identifier
 
-	for {
-		databasesResp, err := c.glueSvc.GetDatabases(ctx, params)
+	paginator := glue.NewGetDatabasesPaginator(c.glueSvc, params)
+	for paginator.HasMorePages() {
+		rsp, err := paginator.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list databases: %w", err)
 		}
 
-		icebergNamespaces = append(icebergNamespaces,
-			filterDatabaseListByType(databasesResp.DatabaseList, glueTypeIceberg)...)
-
-		if databasesResp.NextToken == nil {
-			break
+		for _, database := range rsp.DatabaseList {
+			icebergNamespaces = append(icebergNamespaces, DatabaseIdentifier(aws.ToString(database.Name)))
 		}
-
-		params.NextToken = databasesResp.NextToken
 	}
 
 	return icebergNamespaces, nil
@@ -687,7 +687,7 @@ func (c *Catalog) getTable(ctx context.Context, database, tableName string) (*ty
 		return nil, fmt.Errorf("failed to get table %s.%s: %w", database, tableName, err)
 	}
 
-	if tblRes.Table.Parameters[tableTypePropsKey] != glueTypeIceberg {
+	if !strings.EqualFold(tblRes.Table.Parameters[tableTypePropsKey], glueTypeIceberg) {
 		return nil, fmt.Errorf("table %s.%s is not an iceberg table", database, tableName)
 	}
 
@@ -704,10 +704,6 @@ func (c *Catalog) getDatabase(ctx context.Context, databaseName string) (*types.
 		}
 
 		return nil, fmt.Errorf("failed to get namespace %s: %w", databaseName, err)
-	}
-
-	if database.Database.Parameters[databaseTypePropsKey] != glueTypeIceberg {
-		return nil, fmt.Errorf("namespace %s is not an iceberg namespace", databaseName)
 	}
 
 	return database.Database, nil
@@ -742,23 +738,10 @@ func DatabaseIdentifier(database string) table.Identifier {
 func filterTableListByType(database string, tableList []types.Table, tableType string) []table.Identifier {
 	var filtered []table.Identifier
 	for _, tbl := range tableList {
-		if tbl.Parameters[tableTypePropsKey] != tableType {
+		if !strings.EqualFold(tbl.Parameters[tableTypePropsKey], tableType) {
 			continue
 		}
 		filtered = append(filtered, TableIdentifier(database, aws.ToString(tbl.Name)))
-	}
-
-	return filtered
-}
-
-func filterDatabaseListByType(databases []types.Database, databaseType string) []table.Identifier {
-	var filtered []table.Identifier
-
-	for _, database := range databases {
-		if database.Parameters[databaseTypePropsKey] != databaseType {
-			continue
-		}
-		filtered = append(filtered, DatabaseIdentifier(aws.ToString(database.Name)))
 	}
 
 	return filtered

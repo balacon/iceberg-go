@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	partitionDataIDStart   = 1000
+	PartitionDataIDStart   = 1000
 	InitialPartitionSpecID = 0
 )
 
@@ -199,7 +199,7 @@ func (ps PartitionSpec) String() string {
 
 func (ps *PartitionSpec) LastAssignedFieldID() int {
 	if len(ps.fields) == 0 {
-		return partitionDataIDStart - 1
+		return PartitionDataIDStart - 1
 	}
 
 	id := ps.fields[0].FieldID
@@ -286,10 +286,39 @@ func AssignFreshPartitionSpecIDs(spec *PartitionSpec, old, fresh *Schema) (Parti
 		newFields = append(newFields, PartitionField{
 			Name:      field.Name,
 			SourceID:  freshField.ID,
-			FieldID:   partitionDataIDStart + pos,
+			FieldID:   PartitionDataIDStart + pos,
 			Transform: field.Transform,
 		})
 	}
 
 	return NewPartitionSpec(newFields...), nil
+}
+
+// GeneratePartitionFieldName returns default partition field name based on field transform type
+//
+// The default names are aligned with other client implementations
+// https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/BaseUpdatePartitionSpec.java#L518-L563
+func GeneratePartitionFieldName(schema *Schema, field PartitionField) (string, error) {
+	if len(field.Name) > 0 {
+		return field.Name, nil
+	}
+
+	sourceName, exists := schema.FindColumnName(field.SourceID)
+	if !exists {
+		return "", fmt.Errorf("could not find field with id %d", field.SourceID)
+	}
+
+	transform := field.Transform
+	switch t := transform.(type) {
+	case IdentityTransform:
+		return sourceName, nil
+	case VoidTransform:
+		return sourceName + "_null", nil
+	case BucketTransform:
+		return fmt.Sprintf("%s_bucket_%d", sourceName, t.NumBuckets), nil
+	case TruncateTransform:
+		return fmt.Sprintf("%s_trunc_%d", sourceName, t.Width), nil
+	default:
+		return sourceName + "_" + t.String(), nil
+	}
 }

@@ -1178,7 +1178,14 @@ func computeStatsPlan(sc *iceberg.Schema, props iceberg.Properties) (map[int]tbl
 }
 
 func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilder, paths iter.Seq[string]) iter.Seq2[iceberg.DataFile, error] {
-	return FilesToDataFiles(ctx, fileIO, meta.CurrentSpec(), meta.CurrentSchema(), meta.props, paths, nil, false)
+	partitionSpec, err := meta.CurrentSpec()
+	if err != nil || partitionSpec == nil {
+		return func(yield func(iceberg.DataFile, error) bool) {
+			yield(nil, fmt.Errorf("%w: cannot add files without a current spec", err))
+			return
+		}
+	}
+	return FilesToDataFiles(ctx, fileIO, *partitionSpec, meta.CurrentSchema(), meta.props, paths, nil, false)
 }
 
 func FilesToDataFiles(
@@ -1308,9 +1315,12 @@ func recordsToDataFiles(ctx context.Context, rootLocation string, meta *Metadata
 	if err != nil {
 		panic(err)
 	}
-
+	currentSpec, err := meta.CurrentSpec()
+	if err != nil || currentSpec == nil {
+		panic(fmt.Errorf("%w: cannot write files without a current spec", err))
+	}
 	nextCount, stopCount := iter.Pull(args.counter)
-	if meta.CurrentSpec().IsUnpartitioned() {
+	if currentSpec.IsUnpartitioned() {
 		tasks := func(yield func(WriteTask) bool) {
 			defer stopCount()
 

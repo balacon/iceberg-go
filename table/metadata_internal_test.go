@@ -19,6 +19,8 @@ package table
 
 import (
 	"encoding/json"
+	"os"
+	"path"
 	"slices"
 	"testing"
 
@@ -764,6 +766,77 @@ func TestMetadataBuilderSetDefaultSpecIDLastPartition(t *testing.T) {
 	assert.Equal(t, 0, builder.defaultSpecID)
 }
 
+func TestMetadataBuilderSetLastAddedSchema(t *testing.T) {
+	builder, err := NewMetadataBuilder()
+	assert.NoError(t, err)
+	_, err = builder.SetFormatVersion(2)
+	assert.NoError(t, err)
+	schema := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	_, err = builder.AddSchema(schema)
+	assert.NoError(t, err)
+	_, err = builder.SetCurrentSchemaID(-1)
+	assert.NoError(t, err)
+
+	partitionSpec := iceberg.NewPartitionSpecID(0)
+	_, err = builder.AddPartitionSpec(&partitionSpec, false)
+	assert.NoError(t, err)
+
+	_, err = builder.SetDefaultSpecID(-1)
+	assert.NoError(t, err)
+
+	meta, err := builder.Build()
+	assert.NoError(t, err)
+	assert.Equal(t, schema.ID, meta.CurrentSchema().ID)
+	assert.True(t, schema.Equals(meta.CurrentSchema()))
+}
+
+func TestMetadataBuilderSchemaIncreasingNumbering(t *testing.T) {
+	builder, err := NewMetadataBuilder()
+	assert.NoError(t, err)
+	_, err = builder.SetFormatVersion(2)
+	assert.NoError(t, err)
+	schema := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	_, err = builder.AddSchema(schema)
+	assert.NoError(t, err)
+
+	schema = iceberg.NewSchema(3,
+		iceberg.NestedField{ID: 3, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	_, err = builder.AddSchema(schema)
+	assert.NoError(t, err)
+
+	schema = iceberg.NewSchema(2,
+		iceberg.NestedField{ID: 4, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	_, err = builder.AddSchema(schema)
+	assert.NoError(t, err)
+
+	assert.Equal(t, 1, builder.schemaList[0].ID)
+	assert.Equal(t, 3, builder.schemaList[1].ID)
+	assert.Equal(t, 4, builder.schemaList[2].ID)
+}
+
+func TestMetadataBuilderReuseSchema(t *testing.T) {
+	builder, err := NewMetadataBuilder()
+	assert.NoError(t, err)
+	schema := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	_, err = builder.AddSchema(schema)
+	assert.NoError(t, err)
+	schema2 := iceberg.NewSchema(15,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	_, err = builder.AddSchema(schema2)
+	assert.NoError(t, err)
+	assert.Equal(t, len(builder.schemaList), 1)
+	assert.Equal(t, *builder.lastAddedSchemaID, 1)
+}
+
 func TestMetadataV1Validation(t *testing.T) {
 	// Test case 1: JSON with no last-column-id field
 	noColumnID := `{
@@ -877,4 +950,17 @@ func TestMetadataV2Validation(t *testing.T) {
 
 	// Test case 3: Verify LastColumnId maintains 0 when explicitly set
 	require.NoError(t, meta3.UnmarshalJSON([]byte(zeroColumnID)))
+}
+
+func getTestTableMetadata(fileName string) (Metadata, error) {
+	fCont, err := os.ReadFile(path.Join("testdata", fileName))
+	if err != nil {
+		return nil, err
+	}
+	meta, err := ParseMetadataBytes(fCont)
+	if err != nil {
+		return nil, err
+	}
+
+	return meta, nil
 }

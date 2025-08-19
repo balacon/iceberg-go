@@ -15,8 +15,4 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from pyspark.sql import SparkSession
-
-spark = SparkSession.builder.getOrCreate()
-
-spark.sql("SELECT COUNT(*) FROM default.test_partitioned_by_days").show()
+book

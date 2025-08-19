@@ -33,6 +33,7 @@ import (
 	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -63,56 +64,62 @@ func (s *RestIntegrationSuite) SetupTest() {
 	s.cat = s.loadCatalog(s.ctx)
 }
 
-var (
-	tableSchemaNested = iceberg.NewSchemaWithIdentifiers(1,
-		[]int{1},
-		iceberg.NestedField{
-			ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: true},
-		iceberg.NestedField{
-			ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true},
-		iceberg.NestedField{
-			ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool, Required: false},
-		iceberg.NestedField{
-			ID: 4, Name: "qux", Required: true, Type: &iceberg.ListType{
-				ElementID: 5, Element: iceberg.PrimitiveTypes.String, ElementRequired: true}},
-		iceberg.NestedField{
-			ID: 6, Name: "quux",
-			Type: &iceberg.MapType{
-				KeyID:   7,
-				KeyType: iceberg.PrimitiveTypes.String,
-				ValueID: 8,
-				ValueType: &iceberg.MapType{
-					KeyID:         9,
-					KeyType:       iceberg.PrimitiveTypes.String,
-					ValueID:       10,
-					ValueType:     iceberg.PrimitiveTypes.Int32,
-					ValueRequired: true,
-				},
+var tableSchemaNested = iceberg.NewSchemaWithIdentifiers(1,
+	[]int{1},
+	iceberg.NestedField{
+		ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: true,
+	},
+	iceberg.NestedField{
+		ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true,
+	},
+	iceberg.NestedField{
+		ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool, Required: false,
+	},
+	iceberg.NestedField{
+		ID: 4, Name: "qux", Required: true, Type: &iceberg.ListType{
+			ElementID: 5, Element: iceberg.PrimitiveTypes.String, ElementRequired: true,
+		},
+	},
+	iceberg.NestedField{
+		ID: 6, Name: "quux",
+		Type: &iceberg.MapType{
+			KeyID:   7,
+			KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 8,
+			ValueType: &iceberg.MapType{
+				KeyID:         9,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       10,
+				ValueType:     iceberg.PrimitiveTypes.Int32,
 				ValueRequired: true,
 			},
-			Required: true},
-		iceberg.NestedField{
-			ID: 11, Name: "location", Type: &iceberg.ListType{
-				ElementID: 12, Element: &iceberg.StructType{
-					FieldList: []iceberg.NestedField{
-						{ID: 13, Name: "latitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
-						{ID: 14, Name: "longitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
-					},
-				},
-				ElementRequired: true},
-			Required: true},
-		iceberg.NestedField{
-			ID:   15,
-			Name: "person",
-			Type: &iceberg.StructType{
+			ValueRequired: true,
+		},
+		Required: true,
+	},
+	iceberg.NestedField{
+		ID: 11, Name: "location", Type: &iceberg.ListType{
+			ElementID: 12, Element: &iceberg.StructType{
 				FieldList: []iceberg.NestedField{
-					{ID: 16, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
-					{ID: 17, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+					{ID: 13, Name: "latitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
+					{ID: 14, Name: "longitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
 				},
 			},
-			Required: false,
+			ElementRequired: true,
 		},
-	)
+		Required: true,
+	},
+	iceberg.NestedField{
+		ID:   15,
+		Name: "person",
+		Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 16, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+				{ID: 17, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+			},
+		},
+		Required: false,
+	},
 )
 
 func (s *RestIntegrationSuite) ensureNamespace() {
@@ -254,11 +261,11 @@ func (s *RestIntegrationSuite) TestWriteCommitTable() {
 	pqfile, err := url.JoinPath(location, "data", "test_commit_table_data", "test.parquet")
 	s.Require().NoError(err)
 
-	fw, err := tbl.FS().(io.WriteFileIO).Create(pqfile)
+	fw, err := mustFS(s.T(), tbl).(io.WriteFileIO).Create(pqfile)
 	s.Require().NoError(err)
 	s.Require().NoError(pqarrow.WriteTable(table, fw, table.NumRows(),
 		nil, pqarrow.DefaultWriterProps()))
-	defer tbl.FS().Remove(pqfile)
+	defer mustFS(s.T(), tbl).Remove(pqfile)
 
 	txn := tbl.NewTransaction()
 	s.Require().NoError(txn.AddFiles(s.ctx, []string{pqfile}, nil, false))
@@ -266,7 +273,7 @@ func (s *RestIntegrationSuite) TestWriteCommitTable() {
 	s.Require().NoError(err)
 
 	mf := []iceberg.ManifestFile{}
-	for m, err := range updated.AllManifests() {
+	for m, err := range updated.AllManifests(s.ctx) {
 		s.Require().NoError(err)
 		s.Require().NotNil(m)
 		mf = append(mf, m)
@@ -274,11 +281,17 @@ func (s *RestIntegrationSuite) TestWriteCommitTable() {
 
 	s.Len(mf, 1)
 	s.EqualValues(1, mf[0].AddedDataFiles())
-	entries, err := mf[0].FetchEntries(updated.FS(), false)
+	entries, err := mf[0].FetchEntries(mustFS(s.T(), updated), false)
 	s.Require().NoError(err)
 
 	s.Len(entries, 1)
 	s.Equal(pqfile, entries[0].DataFile().FilePath())
+}
+
+func mustFS(t *testing.T, tbl *table.Table) io.IO {
+	r, err := tbl.FS(context.Background())
+	require.NoError(t, err)
+	return r
 }
 
 func TestRestIntegration(t *testing.T) {

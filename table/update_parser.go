@@ -41,7 +41,7 @@ func ParseUpdateJSON(b []byte) (Update, error) {
 			return nil, err
 		}
 
-		return NewAddSchemaUpdate(up.Schema, up.LastColumnID, false), nil
+		return NewAddSchemaUpdate(up.Schema), nil
 
 	case UpdateAddSnapshot:
 		var up addSnapshotUpdate

@@ -183,8 +183,8 @@ func WithRemoveDataFiles() ExpireSnapshotsOpt {
 }
 
 type ExpiredSnapshotsInfo struct {
-	Snapshots 	 []int64
-	Updates   	 []Update
+	Snapshots    []int64
+	Updates      []Update
 	Requirements []Requirement
 }
 
@@ -279,7 +279,7 @@ func GetExpiredSnapshotsInfo(meta *MetadataBuilder, opts ...ExpireSnapshotsOpt) 
 		}
 	}
 
-	info.Updates = append(info.Updates, NewRemoveSnapshotsUpdate(info.Snapshots))
+	info.Updates = append(info.Updates, NewRemoveSnapshotsUpdateDetailed(info.Snapshots, cfg.postCommitRemoveDataFiles, cfg.postCommitRemoveMetadataFiles))
 
 	return info, nil
 }

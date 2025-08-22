@@ -182,38 +182,51 @@ func WithRemoveDataFiles() ExpireSnapshotsOpt {
 	}
 }
 
+type ExpiredSnapshotsInfo struct {
+	Snapshots 	 []int64
+	Updates   	 []Update
+	Requirements []Requirement
+}
+
 func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
+	info, err := GetExpiredSnapshotsInfo(t.meta, opts...)
+	if err != nil {
+		return err
+	}
+	return t.apply(info.Updates, info.Requirements)
+}
+
+func GetExpiredSnapshotsInfo(meta *MetadataBuilder, opts ...ExpireSnapshotsOpt) (ExpiredSnapshotsInfo, error) {
 	var (
 		cfg         expireSnapshotsCfg
-		updates     []Update
-		reqs        []Requirement
 		snapsToKeep = make(map[int64]struct{})
 		nowMs       = time.Now().UnixMilli()
+		info        = ExpiredSnapshotsInfo{}
 	)
 
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 
-	for refName, ref := range t.meta.refs {
+	for refName, ref := range meta.refs {
 		if refName == MainBranch {
 			snapsToKeep[ref.SnapshotID] = struct{}{}
 		}
 
-		snap, err := t.meta.SnapshotByID(ref.SnapshotID)
+		snap, err := meta.SnapshotByID(ref.SnapshotID)
 		if err != nil {
-			return err
+			return info, err
 		}
 
 		maxRefAgeMs := cmp.Or(ref.MaxRefAgeMs, cfg.maxSnapshotAgeMs)
 		if maxRefAgeMs == nil {
-			return errors.New("cannot find a valid value for maxRefAgeMs")
+			return info, errors.New("cannot find a valid value for maxRefAgeMs")
 		}
 
 		refAge := nowMs - snap.TimestampMs
 		if refAge > *maxRefAgeMs && refName != MainBranch {
-			updates = append(updates, NewRemoveSnapshotRefUpdate(refName))
-			reqs = append(reqs, AssertRefSnapshotID(refName, &ref.SnapshotID))
+			info.Updates = append(info.Updates, NewRemoveSnapshotRefUpdate(refName))
+			info.Requirements = append(info.Requirements, AssertRefSnapshotID(refName, &ref.SnapshotID))
 
 			continue
 		}
@@ -224,7 +237,7 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 		)
 
 		if minSnapshotsToKeep == nil || maxSnapshotAgeMs == nil {
-			return errors.New("cannot find a valid value for minSnapshotsToKeep and maxSnapshotAgeMs")
+			return info, errors.New("cannot find a valid value for minSnapshotsToKeep and maxSnapshotAgeMs")
 		}
 
 		if ref.SnapshotRefType != BranchRef {
@@ -239,9 +252,9 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 		)
 
 		for {
-			snap, err := t.meta.SnapshotByID(snapId)
+			snap, err := meta.SnapshotByID(snapId)
 			if err != nil {
-				return err
+				return info, err
 			}
 
 			snapAge := time.Now().UnixMilli() - snap.TimestampMs
@@ -260,17 +273,15 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 		}
 	}
 
-	var snapsToDelete []int64
-
-	for _, snap := range t.meta.snapshotList {
+	for _, snap := range meta.snapshotList {
 		if _, found := snapsToKeep[snap.SnapshotID]; !found {
-			snapsToDelete = append(snapsToDelete, snap.SnapshotID)
+			info.Snapshots = append(info.Snapshots, snap.SnapshotID)
 		}
 	}
 
-	updates = append(updates, NewRemoveSnapshotsUpdate(snapsToDelete))
+	info.Updates = append(info.Updates, NewRemoveSnapshotsUpdate(info.Snapshots))
 
-	return t.apply(updates, reqs)
+	return info, nil
 }
 
 func (t *Transaction) AppendTable(ctx context.Context, tbl arrow.Table, batchSize int64, snapshotProps iceberg.Properties) error {

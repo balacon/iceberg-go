@@ -150,6 +150,9 @@ func (t *Transaction) UpdateSpec(caseSensitive bool) *UpdateSpec {
 type expireSnapshotsCfg struct {
 	minSnapshotsToKeep *int
 	maxSnapshotAgeMs   *int64
+
+	postCommitRemoveDataFiles     bool
+	postCommitRemoveMetadataFiles bool
 }
 
 type ExpireSnapshotsOpt func(*expireSnapshotsCfg)
@@ -167,10 +170,23 @@ func WithOlderThan(t time.Duration) ExpireSnapshotsOpt {
 	}
 }
 
+func WithRemoveMetadataFiles() ExpireSnapshotsOpt {
+	return func(cfg *expireSnapshotsCfg) {
+		cfg.postCommitRemoveMetadataFiles = true
+	}
+}
+
+func WithRemoveDataFiles() ExpireSnapshotsOpt {
+	return func(cfg *expireSnapshotsCfg) {
+		cfg.postCommitRemoveDataFiles = true
+	}
+}
+
 func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 	var (
 		cfg         expireSnapshotsCfg
 		updates     []Update
+		reqs        []Requirement
 		snapsToKeep = make(map[int64]struct{})
 		nowMs       = time.Now().UnixMilli()
 	)
@@ -197,6 +213,7 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 		refAge := nowMs - snap.TimestampMs
 		if refAge > *maxRefAgeMs && refName != MainBranch {
 			updates = append(updates, NewRemoveSnapshotRefUpdate(refName))
+			reqs = append(reqs, AssertRefSnapshotID(refName, &ref.SnapshotID))
 
 			continue
 		}
@@ -253,7 +270,7 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 
 	updates = append(updates, NewRemoveSnapshotsUpdate(snapsToDelete))
 
-	return t.apply(updates, nil)
+	return t.apply(updates, reqs)
 }
 
 func (t *Transaction) AppendTable(ctx context.Context, tbl arrow.Table, batchSize int64, snapshotProps iceberg.Properties) error {
@@ -499,12 +516,12 @@ func (t *Transaction) StagedTable() (*StagedTable, error) {
 	}, nil
 }
 
-func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
+func (t *Transaction) CommitAsyncPC(ctx context.Context) (*Table, func() error, error) {
 	t.mx.Lock()
 	defer t.mx.Unlock()
 
 	if t.committed {
-		return nil, errors.New("transaction has already been committed")
+		return nil, nil, errors.New("transaction has already been committed")
 	}
 
 	t.committed = true
@@ -513,19 +530,36 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 		t.reqs = append(t.reqs, AssertTableUUID(t.meta.uuid))
 		tbl, err := t.tbl.doCommit(ctx, t.meta.updates, t.reqs)
 		if err != nil {
-			return tbl, err
+			return tbl, nil, err
 		}
 
-		for _, u := range t.meta.updates {
-			if perr := u.PostCommit(ctx, t.tbl, tbl); perr != nil {
-				err = errors.Join(err, perr)
+		return tbl, func() error {
+			var err error
+			for _, u := range t.meta.updates {
+				if perr := u.PostCommit(ctx, t.tbl, tbl); perr != nil {
+					err = errors.Join(err, perr)
+				}
 			}
-		}
-
-		return tbl, err
+			return err
+		}, nil
 	}
 
-	return t.tbl, nil
+	return t.tbl, nil, nil
+}
+
+func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
+	tbl, postCommit, err := t.CommitAsyncPC(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if postCommit != nil {
+		if err := postCommit(); err != nil {
+			return nil, fmt.Errorf("post commit operation failed: %w", err)
+		}
+	}
+
+	return tbl, nil
 }
 
 type StagedTable struct {

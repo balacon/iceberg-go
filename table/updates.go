@@ -439,6 +439,9 @@ func (u *removePropertiesUpdate) Apply(builder *MetadataBuilder) error {
 type removeSnapshotsUpdate struct {
 	baseUpdate
 	SnapshotIDs []int64 `json:"snapshot-ids"`
+
+	postCommitRemoveDataFiles     bool
+	postCommitRemoveMetadataFiles bool
 }
 
 // NewRemoveSnapshotsUpdate creates a new update that removes all snapshots from
@@ -447,6 +450,19 @@ func NewRemoveSnapshotsUpdate(ids []int64) *removeSnapshotsUpdate {
 	return &removeSnapshotsUpdate{
 		baseUpdate:  baseUpdate{ActionName: UpdateRemoveSnapshots},
 		SnapshotIDs: ids,
+
+		postCommitRemoveDataFiles:     true,
+		postCommitRemoveMetadataFiles: true,
+	}
+}
+
+func NewRemoveSnapshotsUpdateDetailed(ids []int64, postCommitRemoveDataFiles, postCommitRemoveMetadataFiles bool) *removeSnapshotsUpdate {
+	return &removeSnapshotsUpdate{
+		baseUpdate:  baseUpdate{ActionName: UpdateRemoveSnapshots},
+		SnapshotIDs: ids,
+
+		postCommitRemoveDataFiles:     postCommitRemoveDataFiles,
+		postCommitRemoveMetadataFiles: postCommitRemoveMetadataFiles,
 	}
 }
 
@@ -457,6 +473,10 @@ func (u *removeSnapshotsUpdate) Apply(builder *MetadataBuilder) error {
 }
 
 func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table, postTable *Table) error {
+	if !u.postCommitRemoveDataFiles && !u.postCommitRemoveMetadataFiles {
+		return nil
+	}
+
 	prefs, err := preTable.FS(ctx)
 	if err != nil {
 		return err
@@ -464,13 +484,15 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 
 	filesToDelete := make(map[string]struct{})
 
-	for _, snapId := range u.SnapshotIDs {
-		snap := preTable.Metadata().SnapshotByID(snapId)
-		if snap == nil {
-			return errors.New("snapshot should never be nil")
-		}
+	if u.postCommitRemoveMetadataFiles {
+		for _, snapId := range u.SnapshotIDs {
+			snap := preTable.Metadata().SnapshotByID(snapId)
+			if snap == nil {
+				return errors.New("snapshot should never be nil")
+			}
 
-		filesToDelete[snap.ManifestList] = struct{}{}
+			filesToDelete[snap.ManifestList] = struct{}{}
+		}
 	}
 
 	for _, snapId := range u.SnapshotIDs {
@@ -485,7 +507,13 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		}
 
 		for _, man := range mans {
-			filesToDelete[man.FilePath()] = struct{}{}
+			if u.postCommitRemoveMetadataFiles {
+				filesToDelete[man.FilePath()] = struct{}{}
+			}
+
+			if !u.postCommitRemoveDataFiles {
+				continue
+			}
 
 			entries, err := man.FetchEntries(prefs, false)
 			if err != nil {
@@ -505,7 +533,13 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		}
 
 		for _, man := range mans {
-			delete(filesToDelete, man.FilePath())
+			if u.postCommitRemoveMetadataFiles {
+				delete(filesToDelete, man.FilePath())
+			}
+
+			if !u.postCommitRemoveDataFiles {
+				continue
+			}
 
 			entries, err := man.FetchEntries(prefs, false)
 			if err != nil {

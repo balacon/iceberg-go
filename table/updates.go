@@ -451,7 +451,7 @@ func NewRemoveSnapshotsUpdate(ids []int64) *removeSnapshotsUpdate {
 		baseUpdate:  baseUpdate{ActionName: UpdateRemoveSnapshots},
 		SnapshotIDs: ids,
 
-		postCommitRemoveDataFiles:     true,
+		postCommitRemoveDataFiles:     false,
 		postCommitRemoveMetadataFiles: true,
 	}
 }
@@ -467,7 +467,7 @@ func NewRemoveSnapshotsUpdateDetailed(ids []int64, postCommitRemoveDataFiles, po
 }
 
 func (u *removeSnapshotsUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.RemoveSnapshots(u.SnapshotIDs)
+	_, err := builder.RemoveSnapshots(u.SnapshotIDs, u.postCommitRemoveDataFiles, u.postCommitRemoveMetadataFiles)
 
 	return err
 }

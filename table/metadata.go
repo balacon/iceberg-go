@@ -348,15 +348,30 @@ func (b *MetadataBuilder) AddSnapshot(snapshot *Snapshot) (*MetadataBuilder, err
 }
 
 func (b *MetadataBuilder) RemoveSnapshots(snapshotIds []int64, postCommitRemoveDataFiles, postCommitRemoveMetadataFiles bool) (*MetadataBuilder, error) {
-	if slices.Contains(snapshotIds, *b.currentSnapshotID) {
+	ids := make(map[int64]struct{}, len(snapshotIds))
+	for _, id := range snapshotIds {
+		ids[id] = struct{}{}
+	}
+
+	if _, ok := ids[*b.currentSnapshotID]; ok {
 		return nil, errors.New("current snapshot cannot be removed")
 	}
 
 	b.snapshotList = slices.DeleteFunc(b.snapshotList, func(e Snapshot) bool {
-		return slices.Contains(snapshotIds, e.SnapshotID)
+		_, ok := ids[e.SnapshotID]
+		return ok
 	})
+	for i := range b.snapshotList {
+		s := &b.snapshotList[i]
+		if s.ParentSnapshotID != nil {
+			if _, ok := ids[*s.ParentSnapshotID]; ok {
+				s.ParentSnapshotID = nil
+			}
+		}
+	}
 	b.snapshotLog = slices.DeleteFunc(b.snapshotLog, func(e SnapshotLogEntry) bool {
-		return slices.Contains(snapshotIds, e.SnapshotID)
+		_, ok := ids[e.SnapshotID]
+		return ok
 	})
 	b.updates = append(b.updates, NewRemoveSnapshotsUpdateDetailed(snapshotIds, postCommitRemoveDataFiles, postCommitRemoveMetadataFiles))
 

@@ -48,6 +48,7 @@ type Table struct {
 	metadataLocation string
 	cat              CatalogIO
 	fsF              FSysF
+	loc              LocationProvider
 }
 
 func (t Table) Equals(other Table) bool {
@@ -79,6 +80,9 @@ func (t Table) Schemas() map[int]*iceberg.Schema {
 }
 
 func (t Table) LocationProvider() (LocationProvider, error) {
+	if t.loc != nil {
+		return t.loc, nil
+	}
 	return LoadLocationProvider(t.metadata.Location(), t.metadata.Properties())
 }
 
@@ -360,6 +364,17 @@ func New(ident Identifier, meta Metadata, metadataLocation string, fsF FSysF, ca
 		metadataLocation: metadataLocation,
 		fsF:              fsF,
 		cat:              cat,
+	}
+}
+
+func NewWithLocationProvider(ident Identifier, meta Metadata, metadataLocation string, fsF FSysF, cat CatalogIO, loc LocationProvider) *Table {
+	return &Table{
+		identifier:       ident,
+		metadata:         meta,
+		metadataLocation: metadataLocation,
+		fsF:              fsF,
+		cat:              cat,
+		loc:              loc,
 	}
 }
 

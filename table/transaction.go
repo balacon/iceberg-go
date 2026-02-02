@@ -218,13 +218,10 @@ func GetExpiredSnapshotsInfo(meta *MetadataBuilder, opts ...ExpireSnapshotsOpt) 
 			return info, err
 		}
 
-		maxRefAgeMs := cmp.Or(ref.MaxRefAgeMs, cfg.maxSnapshotAgeMs)
-		if maxRefAgeMs == nil {
-			return info, errors.New("cannot find a valid value for maxRefAgeMs")
-		}
+		maxRefAgeMs := ref.MaxRefAgeMs
 
 		refAge := nowMs - snap.TimestampMs
-		if refAge > *maxRefAgeMs && refName != MainBranch {
+		if refName != MainBranch && maxRefAgeMs != nil && refAge > *maxRefAgeMs {
 			info.Updates = append(info.Updates, NewRemoveSnapshotRefUpdate(refName))
 			info.Requirements = append(info.Requirements, AssertRefSnapshotID(refName, &ref.SnapshotID))
 

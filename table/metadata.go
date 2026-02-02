@@ -620,7 +620,6 @@ func (b *MetadataBuilder) SetSnapshotRef(
 			TimestampMs: b.lastUpdatedMS,
 		})
 	}
-	b.updates = append(b.updates, NewSetSnapshotRefUpdate(name, snapshotID, refType, maxRefAgeMs, maxSnapshotAgeMs, minSnapshotsToKeep))
 
 	b.refs[name] = ref
 

@@ -42,6 +42,82 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+func TestTokenAuthenticationPriority(t *testing.T) {
+	t.Parallel()
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Track which authentication method was used
+	var authHeader string
+	var oauthCalled bool
+
+	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, r *http.Request) {
+		authHeader = r.Header.Get("Authorization")
+		json.NewEncoder(w).Encode(map[string]any{
+			"defaults": map[string]any{}, "overrides": map[string]any{},
+		})
+	})
+
+	mux.HandleFunc("/v1/oauth/tokens", func(w http.ResponseWriter, r *http.Request) {
+		oauthCalled = true
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "oauth_token_response",
+			"token_type":   "Bearer",
+		})
+	})
+
+	t.Run("token takes precedence over credential", func(t *testing.T) {
+		authHeader = ""
+		oauthCalled = false
+
+		// When both token and credential are provided, token should be used directly
+		cat, err := NewCatalog(context.Background(), "rest", srv.URL,
+			WithOAuthToken("direct_token"),
+			WithCredential("client:secret"))
+
+		require.NoError(t, err)
+		assert.NotNil(t, cat)
+
+		// Should use the direct token, not call OAuth endpoint
+		assert.Equal(t, "Bearer direct_token", authHeader)
+		assert.False(t, oauthCalled, "OAuth endpoint should not be called when token is provided")
+	})
+
+	t.Run("credential used when no token provided", func(t *testing.T) {
+		authHeader = ""
+		oauthCalled = false
+
+		// When only credential is provided, should use OAuth flow
+		cat, err := NewCatalog(context.Background(), "rest", srv.URL,
+			WithCredential("client:secret"))
+
+		require.NoError(t, err)
+		assert.NotNil(t, cat)
+
+		// Should call OAuth endpoint and use returned token
+		assert.Equal(t, "Bearer oauth_token_response", authHeader)
+		assert.True(t, oauthCalled, "OAuth endpoint should be called when only credential is provided")
+	})
+
+	t.Run("direct token only", func(t *testing.T) {
+		authHeader = ""
+		oauthCalled = false
+
+		// When only token is provided, should use it directly
+		cat, err := NewCatalog(context.Background(), "rest", srv.URL,
+			WithOAuthToken("only_token"))
+
+		require.NoError(t, err)
+		assert.NotNil(t, cat)
+
+		// Should use the direct token, not call OAuth endpoint
+		assert.Equal(t, "Bearer only_token", authHeader)
+		assert.False(t, oauthCalled, "OAuth endpoint should not be called when only token is provided")
+	})
+}
+
 func TestScope(t *testing.T) {
 	t.Parallel()
 	mux := http.NewServeMux()
@@ -191,6 +267,126 @@ func TestSigv4EmptyStringHash(t *testing.T) {
 	require.Equal(t, payloadHash, emptyStringHash)
 }
 
+func TestSigv4ContentSha256Header(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.LoadDefaultConfig(context.Background(), func(opts *config.LoadOptions) error {
+		opts.Credentials = credentials.StaticCredentialsProvider{
+			Value: aws.Credentials{
+				AccessKeyID:     "test-access-key",
+				SecretAccessKey: "test-secret-key",
+			},
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	t.Run("header set when sigv4 enabled", func(t *testing.T) {
+		t.Parallel()
+		var capturedHeader string
+		mux := http.NewServeMux()
+		srv := httptest.NewServer(mux)
+		defer srv.Close()
+
+		mux.HandleFunc("/v1/config", func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{
+				"defaults": map[string]any{}, "overrides": map[string]any{},
+			})
+		})
+
+		mux.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
+			capturedHeader = r.Header.Get("x-amz-content-sha256")
+			w.WriteHeader(http.StatusOK)
+		})
+
+		cat, err := NewCatalog(context.Background(), "rest", srv.URL,
+			WithSigV4(),
+			WithSigV4RegionSvc("us-east-1", "s3"),
+			WithAwsConfig(cfg))
+		require.NoError(t, err)
+
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/test", nil)
+		require.NoError(t, err)
+
+		_, err = cat.cl.Do(req)
+		require.NoError(t, err)
+
+		assert.NotEmpty(t, capturedHeader, "x-amz-content-sha256 header should be set when sigv4 is enabled")
+		assert.Equal(t, emptyStringHash, capturedHeader, "header should contain hash of empty body")
+	})
+
+	t.Run("header not set when sigv4 disabled", func(t *testing.T) {
+		t.Parallel()
+		var capturedHeader string
+		headerPresent := false
+		mux := http.NewServeMux()
+		srv := httptest.NewServer(mux)
+		defer srv.Close()
+
+		mux.HandleFunc("/v1/config", func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{
+				"defaults": map[string]any{}, "overrides": map[string]any{},
+			})
+		})
+
+		mux.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
+			capturedHeader = r.Header.Get("x-amz-content-sha256")
+			_, headerPresent = r.Header["X-Amz-Content-Sha256"]
+			w.WriteHeader(http.StatusOK)
+		})
+
+		cat, err := NewCatalog(context.Background(), "rest", srv.URL)
+		require.NoError(t, err)
+
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/test", nil)
+		require.NoError(t, err)
+
+		_, err = cat.cl.Do(req)
+		require.NoError(t, err)
+
+		assert.Empty(t, capturedHeader, "x-amz-content-sha256 header should not be set when sigv4 is disabled")
+		assert.False(t, headerPresent, "x-amz-content-sha256 header should not be present when sigv4 is disabled")
+	})
+
+	t.Run("header contains correct hash for request body", func(t *testing.T) {
+		t.Parallel()
+		var capturedHeader string
+		mux := http.NewServeMux()
+		srv := httptest.NewServer(mux)
+		defer srv.Close()
+
+		mux.HandleFunc("/v1/config", func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{
+				"defaults": map[string]any{}, "overrides": map[string]any{},
+			})
+		})
+
+		mux.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
+			capturedHeader = r.Header.Get("x-amz-content-sha256")
+			w.WriteHeader(http.StatusOK)
+		})
+
+		cat, err := NewCatalog(context.Background(), "rest", srv.URL,
+			WithSigV4(),
+			WithSigV4RegionSvc("us-east-1", "s3"),
+			WithAwsConfig(cfg))
+		require.NoError(t, err)
+
+		body := []byte(`{"test": "data"}`)
+		expectedHash := sha256.Sum256(body)
+		expectedHashStr := hex.EncodeToString(expectedHash[:])
+
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/test", bytes.NewReader(body))
+		require.NoError(t, err)
+
+		_, err = cat.cl.Do(req)
+		require.NoError(t, err)
+
+		assert.Equal(t, expectedHashStr, capturedHeader, "header should contain correct hash of request body")
+	})
+}
+
 func TestSigv4ConcurrentSigners(t *testing.T) {
 	t.Parallel()
 	mux := http.NewServeMux()
@@ -268,4 +464,83 @@ func TestSigv4ConcurrentSigners(t *testing.T) {
 	cancel()
 	require.NoError(t, grp.Wait())
 	t.Logf("issued %d requests", count.Load())
+}
+
+// trackingReadCloser wraps an io.ReadCloser to track if Close() was called
+type trackingReadCloser struct {
+	io.ReadCloser
+	closed bool
+}
+
+func (t *trackingReadCloser) Close() error {
+	t.closed = true
+
+	return t.ReadCloser.Close()
+}
+
+// trackingTransport wraps http.RoundTripper to track response bodies
+type trackingTransport struct {
+	transport http.RoundTripper
+	body      *trackingReadCloser
+}
+
+func (t *trackingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.transport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	t.body = &trackingReadCloser{ReadCloser: resp.Body}
+	resp.Body = t.body
+
+	return resp, nil
+}
+
+// TestResponseBodyLeak checks if response body is closed properly.
+func TestResponseBodyLeak(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mux.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": errorResponse{
+				Message: "not found",
+				Type:    "NoSuchTableException",
+				Code:    404,
+			},
+		})
+	})
+
+	t.Run("do", func(t *testing.T) {
+		tracker := &trackingTransport{transport: http.DefaultTransport}
+		client := &http.Client{Transport: tracker}
+
+		baseURI, err := url.Parse(srv.URL)
+		require.NoError(t, err)
+
+		_, err = do[struct{}](context.Background(), http.MethodGet, baseURI, []string{"test"}, client, nil, false)
+		require.Error(t, err)
+
+		assert.True(t, tracker.body.closed,
+			"response body should be closed on non-200 status")
+	})
+
+	t.Run("doPostAllowNoContent", func(t *testing.T) {
+		tracker := &trackingTransport{transport: http.DefaultTransport}
+		client := &http.Client{Transport: tracker}
+
+		baseURI, err := url.Parse(srv.URL)
+		require.NoError(t, err)
+
+		_, err = doPostAllowNoContent[map[string]string, struct{}](
+			context.Background(), baseURI, []string{"test"}, map[string]string{"key": "value"}, client, nil, false)
+		require.Error(t, err)
+
+		assert.True(t, tracker.body.closed,
+			"response body should be closed on non-200 status")
+	})
 }

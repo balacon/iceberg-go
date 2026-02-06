@@ -40,7 +40,7 @@ import (
 // for literal values. This represents the actual primitive types that exist in Iceberg
 type LiteralType interface {
 	bool | int32 | int64 | float32 | float64 | Date |
-		Time | Timestamp | string | []byte | uuid.UUID | Decimal
+		Time | Timestamp | TimestampNano | string | []byte | uuid.UUID | Decimal
 }
 
 // Comparator is a comparison function for specific literal types:
@@ -97,6 +97,8 @@ func NewLiteral[T LiteralType](val T) Literal {
 		return TimeLiteral(v)
 	case Timestamp:
 		return TimestampLiteral(v)
+	case TimestampNano:
+		return TimestampNsLiteral(v)
 	case string:
 		return StringLiteral(v)
 	case []byte:
@@ -193,6 +195,11 @@ func LiteralFromBytes(typ Type, data []byte) (Literal, error) {
 		return v, err
 	case TimestampType, TimestampTzType:
 		var v TimestampLiteral
+		err := v.UnmarshalBinary(data)
+
+		return v, err
+	case TimestampTzNsType, TimestampNsType:
+		var v TimestampNsLiteral
 		err := v.UnmarshalBinary(data)
 
 		return v, err
@@ -475,7 +482,7 @@ func (i Int32Literal) MarshalBinary() (data []byte, err error) {
 	data = make([]byte, 4)
 	binary.LittleEndian.PutUint32(data, uint32(i))
 
-	return
+	return data, err
 }
 
 func (i *Int32Literal) UnmarshalBinary(data []byte) error {
@@ -521,6 +528,10 @@ func (i Int64Literal) To(t Type) (Literal, error) {
 		return TimestampLiteral(i), nil
 	case TimestampTzType:
 		return TimestampLiteral(i), nil
+	case TimestampNsType:
+		return TimestampNsLiteral(i), nil
+	case TimestampTzNsType:
+		return TimestampNsLiteral(i), nil
 	case DecimalType:
 		unscaled := Decimal{Val: decimal128.FromI64(int64(i)), Scale: 0}
 		if t.scale == 0 {
@@ -562,7 +573,7 @@ func (i Int64Literal) MarshalBinary() (data []byte, err error) {
 	data = make([]byte, 8)
 	binary.LittleEndian.PutUint64(data, uint64(i))
 
-	return
+	return data, err
 }
 
 func (i *Int64Literal) UnmarshalBinary(data []byte) error {
@@ -610,7 +621,7 @@ func (f Float32Literal) MarshalBinary() (data []byte, err error) {
 	data = make([]byte, 4)
 	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(f)))
 
-	return
+	return data, err
 }
 
 func (f *Float32Literal) UnmarshalBinary(data []byte) error {
@@ -664,7 +675,7 @@ func (f Float64Literal) MarshalBinary() (data []byte, err error) {
 	data = make([]byte, 8)
 	binary.LittleEndian.PutUint64(data, math.Float64bits(float64(f)))
 
-	return
+	return data, err
 }
 
 func (f *Float64Literal) UnmarshalBinary(data []byte) error {
@@ -711,7 +722,7 @@ func (d DateLiteral) MarshalBinary() (data []byte, err error) {
 	data = make([]byte, 4)
 	binary.LittleEndian.PutUint32(data, uint32(d))
 
-	return
+	return data, err
 }
 
 func (d *DateLiteral) UnmarshalBinary(data []byte) error {
@@ -755,7 +766,7 @@ func (t TimeLiteral) MarshalBinary() (data []byte, err error) {
 	data = make([]byte, 8)
 	binary.LittleEndian.PutUint64(data, uint64(t))
 
-	return
+	return data, err
 }
 
 func (t *TimeLiteral) UnmarshalBinary(data []byte) error {
@@ -787,6 +798,10 @@ func (t TimestampLiteral) To(typ Type) (Literal, error) {
 		return t, nil
 	case TimestampTzType:
 		return t, nil
+	case TimestampNsType:
+		return TimestampNsLiteral(Timestamp(t).ToNanos()), nil
+	case TimestampTzNsType:
+		return TimestampNsLiteral(Timestamp(t).ToNanos()), nil
 	case DateType:
 		return DateLiteral(Timestamp(t).ToDate()), nil
 	}
@@ -806,7 +821,7 @@ func (t TimestampLiteral) MarshalBinary() (data []byte, err error) {
 	data = make([]byte, 8)
 	binary.LittleEndian.PutUint64(data, uint64(t))
 
-	return
+	return data, err
 }
 
 func (t *TimestampLiteral) UnmarshalBinary(data []byte) error {
@@ -816,6 +831,61 @@ func (t *TimestampLiteral) UnmarshalBinary(data []byte) error {
 			ErrInvalidBinSerialization, len(data))
 	}
 	*t = TimestampLiteral(binary.LittleEndian.Uint64(data))
+
+	return nil
+}
+
+type TimestampNsLiteral TimestampNano
+
+func (TimestampNsLiteral) Comparator() Comparator[TimestampNano] { return cmp.Compare[TimestampNano] }
+func (t TimestampNsLiteral) Type() Type                          { return PrimitiveTypes.TimestampNs }
+func (t TimestampNsLiteral) Value() TimestampNano                { return TimestampNano(t) }
+func (t TimestampNsLiteral) Any() any                            { return t.Value() }
+func (t TimestampNsLiteral) String() string {
+	tm := TimestampNano(t).ToTime()
+
+	return tm.Format("2006-01-02 15:04:05.000000000")
+}
+
+func (t TimestampNsLiteral) To(typ Type) (Literal, error) {
+	switch typ.(type) {
+	case TimestampType:
+		return TimestampLiteral(TimestampNano(t).ToMicros()), nil
+	case TimestampTzType:
+		return TimestampLiteral(TimestampNano(t).ToMicros()), nil
+	case TimestampNsType:
+		return t, nil
+	case TimestampTzNsType:
+		return t, nil
+	case DateType:
+		return DateLiteral(TimestampNano(t).ToDate()), nil
+	}
+
+	return nil, fmt.Errorf("%w: TimestampNsLiteral to %s", ErrBadCast, typ)
+}
+
+func (t TimestampNsLiteral) Equals(other Literal) bool {
+	return literalEq(t, other)
+}
+
+func (t TimestampNsLiteral) Increment() Literal { return TimestampNsLiteral(t + 1) }
+func (t TimestampNsLiteral) Decrement() Literal { return TimestampNsLiteral(t - 1) }
+
+func (t TimestampNsLiteral) MarshalBinary() (data []byte, err error) {
+	// stored as 8 byte little endian
+	data = make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, uint64(t))
+
+	return data, err
+}
+
+func (t *TimestampNsLiteral) UnmarshalBinary(data []byte) error {
+	// stored as 8 byte little endian value representing nanoseconds since epoch
+	if len(data) != 8 {
+		return fmt.Errorf("%w: expected 8 bytes for timestamp value, got %d",
+			ErrInvalidBinSerialization, len(data))
+	}
+	*t = TimestampNsLiteral(binary.LittleEndian.Uint64(data))
 
 	return nil
 }
@@ -950,7 +1020,7 @@ func (s StringLiteral) MarshalBinary() (data []byte, err error) {
 	// avoid copying by just returning a slice of the raw bytes
 	data = unsafe.Slice(unsafe.StringData(string(s)), len(s))
 
-	return
+	return data, err
 }
 
 func (s *StringLiteral) UnmarshalBinary(data []byte) error {
@@ -1008,7 +1078,7 @@ func (b BinaryLiteral) MarshalBinary() (data []byte, err error) {
 	// stored directly as is
 	data = b
 
-	return
+	return data, err
 }
 
 func (b *BinaryLiteral) UnmarshalBinary(data []byte) error {
@@ -1063,7 +1133,7 @@ func (f FixedLiteral) MarshalBinary() (data []byte, err error) {
 	// stored directly as is
 	data = f
 
-	return
+	return data, err
 }
 
 func (f *FixedLiteral) UnmarshalBinary(data []byte) error {
@@ -1240,7 +1310,7 @@ func (d DecimalLiteral) MarshalBinary() (data []byte, err error) {
 		data[len(data)-1] += 1
 	}
 
-	return
+	return data, err
 }
 
 func (d *DecimalLiteral) UnmarshalBinary(data []byte) error {

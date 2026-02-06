@@ -32,6 +32,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/config"
 	"github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
 	tblutils "github.com/apache/iceberg-go/table/internal"
@@ -63,7 +64,7 @@ func VisitArrowSchema[T any](sc *arrow.Schema, visitor ArrowSchemaVisitor[T]) (r
 	if sc == nil {
 		err = fmt.Errorf("%w: cannot visit nil arrow schema", iceberg.ErrInvalidArgument)
 
-		return
+		return res, err
 	}
 
 	defer internal.RecoverError(&err)
@@ -357,7 +358,7 @@ func (c convertToIceberg) Primitive(dt arrow.DataType) (result iceberg.NestedFie
 		panic(fmt.Errorf("%w: unsupported arrow type for conversion - %s", iceberg.ErrInvalidSchema, dt))
 	}
 
-	return
+	return result
 }
 
 func ArrowTypeToIceberg(dt arrow.DataType, downcastNsTimestamp bool) (iceberg.Type, error) {
@@ -587,6 +588,14 @@ func (c convertToArrow) VisitTimestamp() arrow.Field {
 	return arrow.Field{Type: &arrow.TimestampType{Unit: arrow.Microsecond}}
 }
 
+func (c convertToArrow) VisitTimestampNs() arrow.Field {
+	return arrow.Field{Type: &arrow.TimestampType{Unit: arrow.Nanosecond}}
+}
+
+func (c convertToArrow) VisitTimestampNsTz() arrow.Field {
+	return arrow.Field{Type: arrow.FixedWidthTypes.Timestamp_ns}
+}
+
 func (c convertToArrow) VisitString() arrow.Field {
 	if c.useLargeTypes {
 		return arrow.Field{Type: arrow.BinaryTypes.LargeString}
@@ -606,6 +615,14 @@ func (c convertToArrow) VisitBinary() arrow.Field {
 func (c convertToArrow) VisitUUID() arrow.Field {
 	return arrow.Field{Type: extensions.NewUUIDType()}
 }
+
+func (c convertToArrow) VisitUnknown() arrow.Field {
+	return arrow.Field{
+		Type: extensions.NewOpaqueType(arrow.Null, "unknown", "apache.iceberg"),
+	}
+}
+
+var _ iceberg.SchemaVisitorPerPrimitiveType[arrow.Field] = convertToArrow{}
 
 // SchemaToArrowSchema converts an Iceberg schema to an Arrow schema. If the metadata parameter
 // is non-nil, it will be included as the top-level metadata in the schema. If includeFieldIDs
@@ -895,7 +912,7 @@ func (a *arrowProjectionVisitor) Map(m iceberg.MapType, mapArray, keyResult, val
 	valField := a.constructField(m.ValueField(), vals.DataType())
 
 	mapType := arrow.MapOfWithMetadata(keyField.Type, keyField.Metadata, valField.Type, valField.Metadata)
-	childData := array.NewData(mapType.Elem(), arr.Len(), []*memory.Buffer{nil},
+	childData := array.NewData(mapType.Elem(), arr.Data().Children()[0].Len(), []*memory.Buffer{nil},
 		[]arrow.ArrayData{keys.Data(), vals.Data()}, 0, 0)
 	defer childData.Release()
 	newData := array.NewData(mapType, arr.Len(), arr.Data().Buffers(),
@@ -911,7 +928,7 @@ func (a *arrowProjectionVisitor) Primitive(_ iceberg.PrimitiveType, arr arrow.Ar
 
 // ToRequestedSchema will construct a new record batch matching the requested iceberg schema
 // casting columns if necessary as appropriate.
-func ToRequestedSchema(ctx context.Context, requested, fileSchema *iceberg.Schema, batch arrow.Record, downcastTimestamp, includeFieldIDs, useLargeTypes bool) (arrow.Record, error) {
+func ToRequestedSchema(ctx context.Context, requested, fileSchema *iceberg.Schema, batch arrow.RecordBatch, downcastTimestamp, includeFieldIDs, useLargeTypes bool) (arrow.RecordBatch, error) {
 	st := array.RecordToStructArray(batch)
 	defer st.Release()
 
@@ -1215,6 +1232,7 @@ func FilesToDataFiles(
 		for filePath := range paths {
 			format := tblutils.FormatFromFileName(filePath)
 			rdr := must(format.Open(ctx, fileIO, filePath))
+			// TODO: take a look at this defer Close() and consider refactoring
 			defer rdr.Close()
 
 			arrSchema := must(rdr.Schema())
@@ -1243,7 +1261,23 @@ func FilesToDataFiles(
 				continue
 			}
 
-			df := statistics.ToDataFile2(currentSchema, currentSpec, filePath, iceberg.ParquetFile, rdr.SourceFileSize(), fieldIDToPartitionData)
+			partitionValues := make(map[int]any)
+			if !currentSpec.Equals(*iceberg.UnpartitionedSpec) {
+				for field := range currentSpec.Fields() {
+					if !field.Transform.PreservesOrder() {
+						yield(nil, fmt.Errorf("cannot infer partition value from parquet metadata for a non-linear partition field: %s with transform %s", field.Name, field.Transform))
+
+						return
+					}
+
+					partitionVal := statistics.PartitionValue(field, currentSchema)
+					if partitionVal != nil {
+						partitionValues[field.FieldID] = partitionVal
+					}
+				}
+			}
+
+			df := statistics.ToDataFile(currentSchema, currentSpec, filePath, iceberg.ParquetFile, rdr.SourceFileSize(), partitionValues)
 			if !yield(df, nil) {
 				return
 			}
@@ -1251,7 +1285,7 @@ func FilesToDataFiles(
 	}
 }
 
-func recordNBytes(rec arrow.Record) (total int64) {
+func recordNBytes(rec arrow.RecordBatch) (total int64) {
 	for _, c := range rec.Columns() {
 		total += int64(c.Data().SizeInBytes())
 	}
@@ -1259,8 +1293,8 @@ func recordNBytes(rec arrow.Record) (total int64) {
 	return total
 }
 
-func binPackRecords(itr iter.Seq2[arrow.Record, error], recordLookback int, targetFileSize int64) iter.Seq[[]arrow.Record] {
-	return internal.PackingIterator(func(yield func(arrow.Record) bool) {
+func binPackRecords(itr iter.Seq2[arrow.RecordBatch, error], recordLookback int, targetFileSize int64) iter.Seq[[]arrow.RecordBatch] {
+	return internal.PackingIterator(func(yield func(arrow.RecordBatch) bool) {
 		for rec, err := range itr {
 			if err != nil {
 				panic(err)
@@ -1276,7 +1310,7 @@ func binPackRecords(itr iter.Seq2[arrow.Record, error], recordLookback int, targ
 
 type recordWritingArgs struct {
 	sc        *arrow.Schema
-	itr       iter.Seq2[arrow.Record, error]
+	itr       iter.Seq2[arrow.RecordBatch, error]
 	fs        iceio.WriteFileIO
 	writeUUID *uuid.UUID
 	counter   iter.Seq[int]
@@ -1319,6 +1353,7 @@ func recordsToDataFiles(ctx context.Context, rootLocation string, meta *Metadata
 	if err != nil || currentSpec == nil {
 		panic(fmt.Errorf("%w: cannot write files without a current spec", err))
 	}
+
 	nextCount, stopCount := iter.Pull(args.counter)
 	if currentSpec.IsUnpartitioned() {
 		tasks := func(yield func(WriteTask) bool) {
@@ -1338,8 +1373,13 @@ func recordsToDataFiles(ctx context.Context, rootLocation string, meta *Metadata
 			}
 		}
 
-		return writeFiles(ctx, rootLocation, args.fs, meta, tasks)
-	}
+		return writeFiles(ctx, rootLocation, args.fs, meta, nil, tasks)
+	} else {
+		partitionWriter := newPartitionedFanoutWriter(*currentSpec, meta.CurrentSchema(), args.itr)
+		rollingDataWriters := NewWriterFactory(rootLocation, args, meta, taskSchema, targetFileSize)
+		partitionWriter.writers = &rollingDataWriters
+		workers := config.EnvConfig.MaxWorkers
 
-	panic(fmt.Errorf("%w: write stream with partitions", iceberg.ErrNotImplemented))
+		return partitionWriter.Write(ctx, workers)
+	}
 }

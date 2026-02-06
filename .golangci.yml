@@ -19,9 +19,22 @@ version: "2"
 linters:
   default: none
   enable:
+    - errcheck
+    - govet
     - misspell
     - nlreturn
     - perfsprint
+    - staticcheck
+  settings:
+    errcheck:
+      exclude-functions:
+        - (github.com/pterm/pterm.TablePrinter).Render
+        - (github.com/pterm/pterm.TreePrinter).Render
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
   exclusions:
     generated: lax
     presets:
@@ -29,6 +42,10 @@ linters:
       - common-false-positives
       - legacy
       - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+        path: _test\.go$
     paths:
       - third_party$
       - builtin$
@@ -38,6 +55,12 @@ formatters:
     - gofmt
     - gofumpt
     - goimports
+  settings:
+    gofmt:
+      simplify: true
+      rewrite-rules:
+        - pattern: 'interface{}'
+          replacement: 'any'
   exclusions:
     generated: lax
     paths:

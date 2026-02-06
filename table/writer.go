@@ -34,7 +34,7 @@ type WriteTask struct {
 	Uuid        uuid.UUID
 	ID          int
 	Schema      *iceberg.Schema
-	Batches     []arrow.Record
+	Batches     []arrow.RecordBatch
 	SortOrderID int
 }
 
@@ -53,14 +53,14 @@ type writer struct {
 	meta       *MetadataBuilder
 }
 
-func (w *writer) writeFile(ctx context.Context, task WriteTask) (iceberg.DataFile, error) {
+func (w *writer) writeFile(ctx context.Context, partitionValues map[int]any, task WriteTask) (iceberg.DataFile, error) {
 	defer func() {
 		for _, b := range task.Batches {
 			b.Release()
 		}
 	}()
 
-	batches := make([]arrow.Record, len(task.Batches))
+	batches := make([]arrow.RecordBatch, len(task.Batches))
 	for i, b := range task.Batches {
 		rec, err := ToRequestedSchema(ctx, w.fileSchema,
 			task.Schema, b, false, true, false)
@@ -68,6 +68,7 @@ func (w *writer) writeFile(ctx context.Context, task WriteTask) (iceberg.DataFil
 			return nil, err
 		}
 		batches[i] = rec
+		defer rec.Release()
 	}
 
 	statsCols, err := computeStatsPlan(w.fileSchema, w.meta.props)
@@ -78,15 +79,21 @@ func (w *writer) writeFile(ctx context.Context, task WriteTask) (iceberg.DataFil
 	filePath := w.loc.NewDataLocation(
 		task.GenerateDataFileName("parquet"))
 
-	return w.format.WriteDataFile(ctx, w.fs, internal.WriteFileInfo{
+	currentSpec, err := w.meta.CurrentSpec()
+	if err != nil {
+		return nil, err
+	}
+
+	return w.format.WriteDataFile(ctx, w.fs, partitionValues, internal.WriteFileInfo{
 		FileSchema: w.fileSchema,
 		FileName:   filePath,
 		StatsCols:  statsCols,
 		WriteProps: w.props,
+		Spec:       *currentSpec,
 	}, batches)
 }
 
-func writeFiles(ctx context.Context, rootLocation string, fs io.WriteFileIO, meta *MetadataBuilder, tasks iter.Seq[WriteTask]) iter.Seq2[iceberg.DataFile, error] {
+func writeFiles(ctx context.Context, rootLocation string, fs io.WriteFileIO, meta *MetadataBuilder, partitionValues map[int]any, tasks iter.Seq[WriteTask]) iter.Seq2[iceberg.DataFile, error] {
 	locProvider, err := LoadLocationProvider(rootLocation, meta.props)
 	if err != nil {
 		return func(yield func(iceberg.DataFile, error) bool) {
@@ -122,6 +129,6 @@ func writeFiles(ctx context.Context, rootLocation string, fs io.WriteFileIO, met
 	nworkers := config.EnvConfig.MaxWorkers
 
 	return internal.MapExec(nworkers, tasks, func(t WriteTask) (iceberg.DataFile, error) {
-		return w.writeFile(ctx, t)
+		return w.writeFile(ctx, partitionValues, t)
 	})
 }

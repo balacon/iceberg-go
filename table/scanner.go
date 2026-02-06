@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math"
 	"slices"
 	"sync"
 
@@ -53,6 +54,11 @@ func (k *keyDefaultMap[K, V]) Get(key K) V {
 	k.mx.RUnlock()
 	k.mx.Lock()
 	defer k.mx.Unlock()
+
+	// race check between RLock and Lock
+	if v, ok := k.data[key]; ok {
+		return v
+	}
 
 	v := k.defaultFactory(key)
 	k.data[key] = v
@@ -159,6 +165,7 @@ type Scan struct {
 	selectedFields []string
 	caseSensitive  bool
 	snapshotID     *int64
+	asOfTimestamp  *int64
 	options        iceberg.Properties
 	limit          int64
 
@@ -195,6 +202,16 @@ func (scan *Scan) Snapshot() *Snapshot {
 		return scan.metadata.SnapshotByID(*scan.snapshotID)
 	}
 
+	if scan.asOfTimestamp != nil {
+		entries := slices.Collect(scan.metadata.SnapshotLogs())
+		for i := len(entries) - 1; i >= 0; i-- {
+			entry := entries[i]
+			if entry.TimestampMs <= *scan.asOfTimestamp {
+				return scan.metadata.SnapshotByID(entry.SnapshotID)
+			}
+		}
+	}
+
 	return scan.metadata.CurrentSnapshot()
 }
 
@@ -225,33 +242,42 @@ func (scan *Scan) Projection() (*iceberg.Schema, error) {
 }
 
 func (scan *Scan) buildPartitionProjection(specID int) (iceberg.BooleanExpression, error) {
-	project := newInclusiveProjection(scan.metadata.CurrentSchema(),
-		scan.metadata.PartitionSpecs()[specID], true)
+	spec := scan.metadata.PartitionSpecByID(specID)
+	if spec == nil {
+		return nil, fmt.Errorf("%w: id %d", ErrPartitionSpecNotFound, specID)
+	}
+	project := newInclusiveProjection(scan.metadata.CurrentSchema(), *spec, true)
 
 	return project(scan.rowFilter)
 }
 
 func (scan *Scan) buildManifestEvaluator(specID int) (func(iceberg.ManifestFile) (bool, error), error) {
-	spec := scan.metadata.PartitionSpecs()[specID]
+	spec := scan.metadata.PartitionSpecByID(specID)
+	if spec == nil {
+		return nil, fmt.Errorf("%w: id %d", ErrPartitionSpecNotFound, specID)
+	}
 
-	return newManifestEvaluator(spec, scan.metadata.CurrentSchema(),
+	return newManifestEvaluator(*spec, scan.metadata.CurrentSchema(),
 		scan.partitionFilters.Get(specID), scan.caseSensitive)
 }
 
-func (scan *Scan) buildPartitionEvaluator(specID int) func(iceberg.DataFile) (bool, error) {
-	spec := scan.metadata.PartitionSpecs()[specID]
+func (scan *Scan) buildPartitionEvaluator(specID int) (func(iceberg.DataFile) (bool, error), error) {
+	spec := scan.metadata.PartitionSpecByID(specID)
+	if spec == nil {
+		return nil, fmt.Errorf("%w: id %d", ErrPartitionSpecNotFound, specID)
+	}
 	partType := spec.PartitionType(scan.metadata.CurrentSchema())
 	partSchema := iceberg.NewSchema(0, partType.FieldList...)
 	partExpr := scan.partitionFilters.Get(specID)
 
-	return func(d iceberg.DataFile) (bool, error) {
-		fn, err := iceberg.ExpressionEvaluator(partSchema, partExpr, scan.caseSensitive)
-		if err != nil {
-			return false, err
-		}
-
-		return fn(getPartitionRecord(d, partType))
+	fn, err := iceberg.ExpressionEvaluator(partSchema, partExpr, scan.caseSensitive)
+	if err != nil {
+		return nil, err
 	}
+
+	return func(d iceberg.DataFile) (bool, error) {
+		return fn(getPartitionRecord(d, partType))
+	}, nil
 }
 
 func (scan *Scan) checkSequenceNumber(minSeqNum int64, manifest iceberg.ManifestFile) bool {
@@ -261,11 +287,14 @@ func (scan *Scan) checkSequenceNumber(minSeqNum int64, manifest iceberg.Manifest
 }
 
 func minSequenceNum(manifests []iceberg.ManifestFile) int64 {
-	n := int64(0)
+	var n int64 = math.MaxInt64
 	for _, m := range manifests {
 		if m.ManifestContent() == iceberg.ManifestContentData {
 			n = min(n, m.MinSequenceNum())
 		}
+	}
+	if n == math.MaxInt64 {
+		return 0
 	}
 
 	return n
@@ -350,7 +379,7 @@ func (scan *Scan) collectManifestEntries(
 	g, _ := errgroup.WithContext(ctx)
 	g.SetLimit(concurrencyLimit)
 
-	partitionEvaluators := newKeyDefaultMap(scan.buildPartitionEvaluator)
+	partitionEvaluators := newKeyDefaultMapWrapErr(scan.buildPartitionEvaluator)
 
 	for _, mf := range manifestList {
 		if !scan.checkSequenceNumber(minSeqNum, mf) {
@@ -397,6 +426,23 @@ func (scan *Scan) collectManifestEntries(
 // PlanFiles orchestrates the fetching and filtering of manifests, and then
 // building a list of FileScanTasks that match the current Scan criteria.
 func (scan *Scan) PlanFiles(ctx context.Context) ([]FileScanTask, error) {
+	if scan.asOfTimestamp != nil {
+		var snapshot *Snapshot
+		entries := slices.Collect(scan.metadata.SnapshotLogs())
+		for i := len(entries) - 1; i >= 0; i-- {
+			entry := entries[i]
+			if entry.TimestampMs <= *scan.asOfTimestamp {
+				snapshot = scan.metadata.SnapshotByID(entry.SnapshotID)
+
+				break
+			}
+		}
+		if snapshot == nil {
+			return nil, fmt.Errorf("no snapshot found for timestamp %d", *scan.asOfTimestamp)
+		}
+		scan.snapshotID = &snapshot.SnapshotID
+		scan.asOfTimestamp = nil
+	}
 	// Step 1: Retrieve filtered manifests based on snapshot and partition specs.
 	manifestList, err := scan.fetchPartitionSpecFilteredManifests(ctx)
 	if err != nil || len(manifestList) == 0 {
@@ -445,7 +491,7 @@ type FileScanTask struct {
 //
 // The purpose for returning the schema up front is to handle the case where there are no
 // rows returned. The resulting Arrow Schema of the projection will still be known.
-func (scan *Scan) ToArrowRecords(ctx context.Context) (*arrow.Schema, iter.Seq2[arrow.Record, error], error) {
+func (scan *Scan) ToArrowRecords(ctx context.Context) (*arrow.Schema, iter.Seq2[arrow.RecordBatch, error], error) {
 	tasks, err := scan.PlanFiles(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -489,7 +535,7 @@ func (scan *Scan) ToArrowTable(ctx context.Context) (arrow.Table, error) {
 		return nil, err
 	}
 
-	records := make([]arrow.Record, 0)
+	records := make([]arrow.RecordBatch, 0)
 	for rec, err := range itr {
 		if err != nil {
 			return nil, err

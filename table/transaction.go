@@ -147,12 +147,30 @@ func (t *Transaction) UpdateSpec(caseSensitive bool) *UpdateSpec {
 	return NewUpdateSpec(t, caseSensitive)
 }
 
+// UpdateSchema creates a new UpdateSchema instance for managing schema changes
+// within this transaction.
+//
+// Parameters:
+//   - caseSensitive: If true, field name lookups are case-sensitive; if false,
+//     field names are matched case-insensitively.
+//   - allowIncompatibleChanges: If true, allows schema changes that would normally
+//     be rejected for being incompatible (e.g., adding required fields without
+//     default values, changing field types in non-promotable ways, or changing
+//     column nullability from optional to required).
+//   - opts: Optional configuration functions to customize the UpdateSchema behavior.
+//
+// Returns an UpdateSchema instance that can be used to build and apply schema changes.
+func (t *Transaction) UpdateSchema(caseSensitive bool, allowIncompatibleChanges bool, opts ...UpdateSchemaOption) *UpdateSchema {
+	return NewUpdateSchema(t, caseSensitive, allowIncompatibleChanges, opts...)
+}
+
 type expireSnapshotsCfg struct {
 	minSnapshotsToKeep *int
 	maxSnapshotAgeMs   *int64
 
 	postCommitRemoveDataFiles     bool
 	postCommitRemoveMetadataFiles bool
+	postCommit                    bool
 }
 
 type ExpireSnapshotsOpt func(*expireSnapshotsCfg)
@@ -182,6 +200,16 @@ func WithRemoveDataFiles() ExpireSnapshotsOpt {
 	}
 }
 
+// WithPostCommit controls whether orphaned files (manifests, manifest lists,
+// data files) are deleted immediately after expiring snapshots. Defaults to true.
+// Set to false to defer file deletion to a separate maintenance job, avoiding
+// conflicts with in-flight queries that may still reference those files.
+func WithPostCommit(postCommit bool) ExpireSnapshotsOpt {
+	return func(cfg *expireSnapshotsCfg) {
+		cfg.postCommit = postCommit
+	}
+}
+
 type ExpiredSnapshotsInfo struct {
 	Snapshots    []int64
 	Updates      []Update
@@ -198,7 +226,7 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 
 func GetExpiredSnapshotsInfo(meta *MetadataBuilder, opts ...ExpireSnapshotsOpt) (ExpiredSnapshotsInfo, error) {
 	var (
-		cfg         expireSnapshotsCfg
+		cfg         = expireSnapshotsCfg{postCommit: true}
 		snapsToKeep = make(map[int64]struct{})
 		nowMs       = time.Now().UnixMilli()
 		info        = ExpiredSnapshotsInfo{}
@@ -209,6 +237,12 @@ func GetExpiredSnapshotsInfo(meta *MetadataBuilder, opts ...ExpireSnapshotsOpt) 
 	}
 
 	for refName, ref := range meta.refs {
+		// Assert that this ref's snapshot ID hasn't changed concurrently.
+		// This ensures we don't accidentally expire snapshots that are now
+		// referenced by updated refs.
+		snapshotID := ref.SnapshotID
+		info.Requirements = append(info.Requirements, AssertRefSnapshotID(refName, &snapshotID))
+
 		if refName == MainBranch {
 			snapsToKeep[ref.SnapshotID] = struct{}{}
 		}
@@ -251,7 +285,9 @@ func GetExpiredSnapshotsInfo(meta *MetadataBuilder, opts ...ExpireSnapshotsOpt) 
 		for {
 			snap, err := meta.SnapshotByID(snapId)
 			if err != nil {
-				return info, err
+				// Parent snapshot may have been removed by a previous expiration.
+				// Treat missing parent as end of chain - this is expected behavior.
+				break
 			}
 
 			snapAge := time.Now().UnixMilli() - snap.TimestampMs
@@ -276,7 +312,12 @@ func GetExpiredSnapshotsInfo(meta *MetadataBuilder, opts ...ExpireSnapshotsOpt) 
 		}
 	}
 
-	info.Updates = append(info.Updates, NewRemoveSnapshotsUpdateDetailed(info.Snapshots, cfg.postCommitRemoveDataFiles, cfg.postCommitRemoveMetadataFiles))
+	// Only add the update if there are actually snapshots to delete
+	if len(info.Snapshots) > 0 {
+		update := NewRemoveSnapshotsUpdateDetailed(info.Snapshots, cfg.postCommitRemoveDataFiles, cfg.postCommitRemoveMetadataFiles)
+		update.postCommit = cfg.postCommit
+		info.Updates = append(info.Updates, update)
+	}
 
 	return info, nil
 }

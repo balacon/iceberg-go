@@ -30,10 +30,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/compute/exprs"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
+	iceinternal "github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table/internal"
 	"github.com/apache/iceberg-go/table/substrait"
-	"github.com/substrait-io/substrait-go/v4/expr"
+	"github.com/substrait-io/substrait-go/v7/expr"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -98,7 +99,7 @@ func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, 
 	return deletesPerFile, err
 }
 
-func readDeletes(ctx context.Context, fs iceio.IO, dataFile iceberg.DataFile) (map[string]*arrow.Chunked, error) {
+func readDeletes(ctx context.Context, fs iceio.IO, dataFile iceberg.DataFile) (_ map[string]*arrow.Chunked, err error) {
 	src, err := internal.GetFile(ctx, fs, dataFile, true)
 	if err != nil {
 		return nil, err
@@ -108,7 +109,7 @@ func readDeletes(ctx context.Context, fs iceio.IO, dataFile iceberg.DataFile) (m
 	if err != nil {
 		return nil, err
 	}
-	defer rdr.Close()
+	defer iceinternal.CheckedClose(rdr, &err)
 
 	tbl, err := rdr.ReadTable(ctx)
 	if err != nil {
@@ -164,12 +165,12 @@ func combinePositionalDeletes(mem memory.Allocator, deletes set[int64], start, e
 	return bldr.NewArray()
 }
 
-type recProcessFn func(arrow.Record) (arrow.Record, error)
+type recProcessFn func(arrow.RecordBatch) (arrow.RecordBatch, error)
 
 func processPositionalDeletes(ctx context.Context, deletes set[int64]) recProcessFn {
 	nextIdx, mem := int64(0), compute.GetAllocator(ctx)
 
-	return func(r arrow.Record) (arrow.Record, error) {
+	return func(r arrow.RecordBatch) (arrow.RecordBatch, error) {
 		defer r.Release()
 
 		currentIdx := nextIdx
@@ -189,7 +190,7 @@ func processPositionalDeletes(ctx context.Context, deletes set[int64]) recProces
 }
 
 func filterRecords(ctx context.Context, recordFilter expr.Expression) recProcessFn {
-	return func(rec arrow.Record) (arrow.Record, error) {
+	return func(rec arrow.RecordBatch) (arrow.RecordBatch, error) {
 		defer rec.Release()
 
 		input := compute.NewDatumWithoutOwning(rec)
@@ -249,7 +250,7 @@ func (as *arrowScan) projectedFieldIDs() (set[int], error) {
 }
 
 type enumeratedRecord struct {
-	Record internal.Enumerated[arrow.Record]
+	Record internal.Enumerated[arrow.RecordBatch]
 	Task   internal.Enumerated[FileScanTask]
 	Err    error
 }
@@ -350,18 +351,18 @@ func (as *arrowScan) processRecords(
 
 	var (
 		idx  int
-		prev arrow.Record
+		prev arrow.RecordBatch
 	)
 
 	for recRdr.Next() {
 		if prev != nil {
-			out <- enumeratedRecord{Record: internal.Enumerated[arrow.Record]{
+			out <- enumeratedRecord{Record: internal.Enumerated[arrow.RecordBatch]{
 				Value: prev, Index: idx, Last: false,
 			}, Task: task}
 			idx++
 		}
 
-		prev = recRdr.Record()
+		prev = recRdr.RecordBatch()
 		prev.Retain()
 
 		for _, f := range pipeline {
@@ -373,7 +374,7 @@ func (as *arrowScan) processRecords(
 	}
 
 	if prev != nil {
-		out <- enumeratedRecord{Record: internal.Enumerated[arrow.Record]{
+		out <- enumeratedRecord{Record: internal.Enumerated[arrow.RecordBatch]{
 			Value: prev, Index: idx, Last: true,
 		}, Task: task}
 	}
@@ -402,9 +403,9 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 
 	iceSchema, colIndices, rdr, err = as.prepareToRead(ctx, task.Value.File)
 	if err != nil {
-		return
+		return err
 	}
-	defer rdr.Close()
+	defer iceinternal.CheckedClose(rdr, &err)
 
 	pipeline := make([]recProcessFn, 0, 2)
 	if len(positionalDeletes) > 0 {
@@ -422,7 +423,7 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 
 	filterFunc, dropFile, err = as.getRecordFilter(ctx, iceSchema)
 	if err != nil {
-		return
+		return err
 	}
 
 	if dropFile {
@@ -431,18 +432,18 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 		if err != nil {
 			return err
 		}
-		out <- enumeratedRecord{Task: task, Record: internal.Enumerated[arrow.Record]{
-			Value: array.NewRecord(emptySchema, nil, 0), Index: 0, Last: true,
+		out <- enumeratedRecord{Task: task, Record: internal.Enumerated[arrow.RecordBatch]{
+			Value: array.NewRecordBatch(emptySchema, nil, 0), Index: 0, Last: true,
 		}}
 
-		return
+		return err
 	}
 
 	if filterFunc != nil {
 		pipeline = append(pipeline, filterFunc)
 	}
 
-	pipeline = append(pipeline, func(r arrow.Record) (arrow.Record, error) {
+	pipeline = append(pipeline, func(r arrow.RecordBatch) (arrow.RecordBatch, error) {
 		defer r.Release()
 
 		return ToRequestedSchema(ctx, as.projectedSchema, iceSchema, r, false, false, as.useLargeTypes)
@@ -450,10 +451,10 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 
 	err = as.processRecords(ctx, task, iceSchema, rdr, colIndices, pipeline, out)
 
-	return
+	return err
 }
 
-func createIterator(ctx context.Context, numWorkers uint, records <-chan enumeratedRecord, deletesPerFile perFilePosDeletes, cancel context.CancelCauseFunc, rowLimit int64) iter.Seq2[arrow.Record, error] {
+func createIterator(ctx context.Context, numWorkers uint, records <-chan enumeratedRecord, deletesPerFile perFilePosDeletes, cancel context.CancelCauseFunc, rowLimit int64) iter.Seq2[arrow.RecordBatch, error] {
 	isBeforeAny := func(batch enumeratedRecord) bool {
 		return batch.Task.Index < 0
 	}
@@ -488,7 +489,7 @@ func createIterator(ctx context.Context, numWorkers uint, records <-chan enumera
 
 	totalRowCount := int64(0)
 
-	return func(yield func(arrow.Record, error) bool) {
+	return func(yield func(arrow.RecordBatch, error) bool) {
 		defer func() {
 			for rec := range sequenced {
 				if rec.Record.Value != nil {
@@ -553,7 +554,7 @@ func createIterator(ctx context.Context, numWorkers uint, records <-chan enumera
 	}
 }
 
-func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks []FileScanTask, deletesPerFile perFilePosDeletes) iter.Seq2[arrow.Record, error] {
+func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks []FileScanTask, deletesPerFile perFilePosDeletes) iter.Seq2[arrow.RecordBatch, error] {
 	extSet := substrait.NewExtensionSet()
 	as.nameMapping = as.metadata.NameMapping()
 
@@ -605,7 +606,7 @@ func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks
 		cancel, as.rowLimit)
 }
 
-func (as *arrowScan) GetRecords(ctx context.Context, tasks []FileScanTask) (*arrow.Schema, iter.Seq2[arrow.Record, error], error) {
+func (as *arrowScan) GetRecords(ctx context.Context, tasks []FileScanTask) (*arrow.Schema, iter.Seq2[arrow.RecordBatch, error], error) {
 	var err error
 	as.useLargeTypes, err = strconv.ParseBool(as.options.Get(ScanOptionArrowUseLargeTypes, "false"))
 	if err != nil {
@@ -618,7 +619,7 @@ func (as *arrowScan) GetRecords(ctx context.Context, tasks []FileScanTask) (*arr
 	}
 
 	if as.rowLimit == 0 {
-		return resultSchema, func(yield func(arrow.Record, error) bool) {}, nil
+		return resultSchema, func(yield func(arrow.RecordBatch, error) bool) {}, nil
 	}
 
 	deletesPerFile, err := readAllDeleteFiles(ctx, as.fs, tasks, as.concurrency)

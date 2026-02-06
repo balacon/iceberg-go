@@ -57,7 +57,7 @@ func ParseUpdateJSON(b []byte) (Update, error) {
 			return nil, err
 		}
 
-		return NewAddSortOrderUpdate(up.SortOrder, false), nil
+		return NewAddSortOrderUpdate(up.SortOrder), nil
 
 	case UpdateAssignUUID:
 		var up assignUUIDUpdate

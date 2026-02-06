@@ -18,6 +18,7 @@
 package table
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -156,28 +157,35 @@ func (of *overwriteFiles) ExistingManifests() ([]iceberg.ManifestFile, error) {
 			continue
 		}
 
-		spec, err := of.base.txn.meta.GetSpecByID(int(m.PartitionSpecID()))
-		if err != nil {
-			return existingFiles, err
-		}
-
-		wr, path, counter, err := of.base.newManifestWriter(*spec)
-		if err != nil {
-			return existingFiles, err
-		}
-
-		for _, entry := range notDeleted {
-			if err := wr.Existing(entry); err != nil {
-				return existingFiles, err
+		// wrap in a function to ensure that the writer is closed even if a panic occurs
+		rewriteManifest := func(m iceberg.ManifestFile, notDeleted []iceberg.ManifestEntry) (_ iceberg.ManifestFile, retErr error) {
+			spec, err := of.base.txn.meta.GetSpecByID(int(m.PartitionSpecID()))
+			if err != nil {
+				return nil, err
 			}
+
+			wr, path, counter, fileCloser, err := of.base.newManifestWriter(*spec)
+			if err != nil {
+				return nil, err
+			}
+			defer internal.CheckedClose(fileCloser, &retErr)
+			defer internal.CheckedClose(wr, &retErr)
+
+			for _, entry := range notDeleted {
+				if err := wr.Existing(entry); err != nil {
+					return nil, err
+				}
+			}
+
+			// close the writer to force a flush and ensure counter.Count is accurate
+			if err := wr.Close(); err != nil {
+				return nil, err
+			}
+
+			return wr.ToManifestFile(path, counter.Count)
 		}
 
-		// close the writer to force a flush and ensure counter.Count is accurate
-		if err := wr.Close(); err != nil {
-			return existingFiles, err
-		}
-
-		mf, err := wr.ToManifestFile(path, counter.Count)
+		mf, err := rewriteManifest(m, notDeleted)
 		if err != nil {
 			return existingFiles, err
 		}
@@ -259,11 +267,13 @@ func (m *manifestMergeManager) groupBySpec(manifests []iceberg.ManifestFile) map
 	return groups
 }
 
-func (m *manifestMergeManager) createManifest(specID int, bin []iceberg.ManifestFile) (iceberg.ManifestFile, error) {
-	wr, path, counter, err := m.snap.newManifestWriter(m.snap.spec(specID))
+func (m *manifestMergeManager) createManifest(specID int, bin []iceberg.ManifestFile) (mf iceberg.ManifestFile, err error) {
+	wr, path, counter, fileCloser, err := m.snap.newManifestWriter(m.snap.spec(specID))
 	if err != nil {
 		return nil, err
 	}
+	defer internal.CheckedClose(fileCloser, &err)
+	defer internal.CheckedClose(wr, &err)
 
 	for _, manifest := range bin {
 		entries, err := m.snap.fetchManifestEntry(manifest, false)
@@ -275,13 +285,17 @@ func (m *manifestMergeManager) createManifest(specID int, bin []iceberg.Manifest
 			switch {
 			case entry.Status() == iceberg.EntryStatusDELETED && entry.SnapshotID() == m.snap.snapshotID:
 				// only files deleted by this snapshot should be added to the new manifest
-				wr.Delete(entry)
+				err = wr.Delete(entry)
 			case entry.Status() == iceberg.EntryStatusADDED && entry.SnapshotID() == m.snap.snapshotID:
 				// added entries from this snapshot are still added, otherwise they should be existing
-				wr.Add(entry)
+				err = wr.Add(entry)
 			case entry.Status() != iceberg.EntryStatusDELETED:
 				// add all non-deleted files from the old manifest as existing files
-				wr.Existing(entry)
+				err = wr.Existing(entry)
+			}
+
+			if err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -486,22 +500,20 @@ func (sp *snapshotProducer) deleteDataFile(df iceberg.DataFile) *snapshotProduce
 	return sp
 }
 
-func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec) (*iceberg.ManifestWriter, string, *internal.CountingWriter, error) {
+func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec) (_ *iceberg.ManifestWriter, _ string, _ *internal.CountingWriter, _ io.Closer, err error) {
 	out, path, err := sp.newManifestOutput()
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", nil, nil, err
 	}
 
 	counter := &internal.CountingWriter{W: out}
 	wr, err := iceberg.NewManifestWriter(sp.txn.meta.formatVersion, counter, spec,
 		sp.txn.meta.CurrentSchema(), sp.snapshotID)
 	if err != nil {
-		defer out.Close()
-
-		return nil, "", nil, err
+		return nil, "", nil, nil, errors.Join(err, out.Close())
 	}
 
-	return wr, path, counter, nil
+	return wr, path, counter, out, nil
 }
 
 func (sp *snapshotProducer) newManifestOutput() (io.WriteCloser, string, error) {
@@ -523,18 +535,23 @@ func (sp *snapshotProducer) fetchManifestEntry(m iceberg.ManifestFile, discardDe
 	return m.FetchEntries(sp.io, discardDeleted)
 }
 
-func (sp *snapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
+func (sp *snapshotProducer) manifests() (_ []iceberg.ManifestFile, err error) {
+	deleted, err := sp.DeletedEntries()
+	if err != nil {
+		return nil, err
+	}
+
 	var g errgroup.Group
 
 	results := [...][]iceberg.ManifestFile{nil, nil, nil}
 
 	if len(sp.addedFiles) > 0 {
-		g.Go(func() error {
+		g.Go(func() (err error) {
 			out, path, err := sp.newManifestOutput()
 			if err != nil {
 				return err
 			}
-			defer out.Close()
+			defer internal.CheckedClose(out, &err)
 
 			counter := &internal.CountingWriter{W: out}
 			currentSpec, err := sp.txn.meta.CurrentSpec()
@@ -547,6 +564,7 @@ func (sp *snapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 			if err != nil {
 				return err
 			}
+			defer internal.CheckedClose(wr, &err)
 
 			for _, df := range sp.addedFiles {
 				err := wr.Add(iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &sp.snapshotID,
@@ -570,11 +588,6 @@ func (sp *snapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 		})
 	}
 
-	deleted, err := sp.DeletedEntries()
-	if err != nil {
-		return nil, err
-	}
-
 	if len(deleted) > 0 {
 		g.Go(func() error {
 			partitionGroups := map[int][]iceberg.ManifestEntry{}
@@ -585,15 +598,24 @@ func (sp *snapshotProducer) manifests() ([]iceberg.ManifestFile, error) {
 				partitionGroups[specid] = append(group, entry)
 			}
 
-			for specid, entries := range partitionGroups {
+			writeGroup := func(specid int, entries []iceberg.ManifestEntry) (_ iceberg.ManifestFile, retErr error) {
 				out, path, err := sp.newManifestOutput()
 				if err != nil {
-					return err
+					return nil, err
 				}
-				defer out.Close()
+				defer internal.CheckedClose(out, &retErr)
 
 				mf, err := iceberg.WriteManifest(path, out, sp.txn.meta.formatVersion,
 					sp.spec(specid), sp.txn.meta.CurrentSchema(), sp.snapshotID, entries)
+				if err != nil {
+					return nil, err
+				}
+
+				return mf, nil
+			}
+
+			for specid, entries := range partitionGroups {
+				mf, err := writeGroup(specid, entries)
 				if err != nil {
 					return err
 				}
@@ -635,13 +657,17 @@ func (sp *snapshotProducer) summary(props iceberg.Properties) (Summary, error) {
 		return Summary{}, fmt.Errorf("could not get current partition spec: %w", err)
 	}
 	for _, df := range sp.addedFiles {
-		ssc.addFile(df, currentSchema, *partitionSpec)
+		if err = ssc.addFile(df, currentSchema, *partitionSpec); err != nil {
+			return Summary{}, err
+		}
 	}
 
 	if len(sp.deletedFiles) > 0 {
 		specs := sp.txn.meta.specs
 		for _, df := range sp.deletedFiles {
-			ssc.removeFile(df, currentSchema, specs[df.SpecID()])
+			if err = ssc.removeFile(df, currentSchema, specs[df.SpecID()]); err != nil {
+				return Summary{}, err
+			}
 		}
 	}
 
@@ -664,7 +690,7 @@ func (sp *snapshotProducer) summary(props iceberg.Properties) (Summary, error) {
 	}, previousSummary)
 }
 
-func (sp *snapshotProducer) commit() ([]Update, []Requirement, error) {
+func (sp *snapshotProducer) commit() (_ []Update, _ []Requirement, err error) {
 	newManifests, err := sp.manifests()
 	if err != nil {
 		return nil, nil, err
@@ -693,10 +719,11 @@ func (sp *snapshotProducer) commit() ([]Update, []Requirement, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	defer out.Close()
+	defer internal.CheckedClose(out, &err)
 
+	// TODO: Implement v3 here
 	err = iceberg.WriteManifestList(sp.txn.meta.formatVersion, out,
-		sp.snapshotID, parentSnapshot, &nextSequence, newManifests)
+		sp.snapshotID, parentSnapshot, &nextSequence, 0, newManifests)
 	if err != nil {
 		return nil, nil, err
 	}

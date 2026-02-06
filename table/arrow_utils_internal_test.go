@@ -44,6 +44,7 @@ func constructTestTable(t *testing.T, writeStats []string) (*metadata.FileMetaDa
         "last-column-id": 7,
         "current-schema-id": 0,
 		"last-updated-ms": -1,
+		"last-partition-id": 0,
         "schemas": [
             {
                 "type": "struct",
@@ -87,7 +88,9 @@ func constructTestTable(t *testing.T, writeStats []string) (*metadata.FileMetaDa
         ],
         "default-spec-id": 0,
         "partition-specs": [{"spec-id": 0, "fields": []}],
-        "properties": {}
+        "properties": {},
+		"sort-orders": [{"order-id": 0, "fields": []}],
+		"default-sort-order-id": 0
 	}`)
 	require.NoError(t, err)
 
@@ -139,7 +142,7 @@ func constructTestTable(t *testing.T, writeStats []string) (*metadata.FileMetaDa
 	xb.Append(54)
 	yb.AppendNull()
 
-	rec := bldr.NewRecord()
+	rec := bldr.NewRecordBatch()
 	defer rec.Release()
 
 	var opts []parquet.WriterProperty
@@ -181,9 +184,9 @@ func (suite *FileStatsMetricsSuite) getDataFile(meta iceberg.Properties, writeSt
 
 	schema := tableMeta.CurrentSchema()
 	if len(meta) > 0 {
-		bldr, err := MetadataBuilderFromBase(tableMeta)
+		bldr, err := MetadataBuilderFromBase(tableMeta, "")
 		suite.Require().NoError(err)
-		_, err = bldr.SetProperties(meta)
+		err = bldr.SetProperties(meta)
 		suite.Require().NoError(err)
 		tableMeta, err = bldr.Build()
 		suite.Require().NoError(err)
@@ -197,7 +200,7 @@ func (suite *FileStatsMetricsSuite) getDataFile(meta iceberg.Properties, writeSt
 	stats := format.DataFileStatsFromMeta(fileMeta, collector, mapping)
 
 	return stats.ToDataFile(tableMeta.CurrentSchema(), tableMeta.PartitionSpec(), "fake-path.parquet",
-		iceberg.ParquetFile, fileMeta.GetSourceFileSize())
+		iceberg.ParquetFile, fileMeta.GetSourceFileSize(), nil)
 }
 
 func (suite *FileStatsMetricsSuite) TestRecordCount() {

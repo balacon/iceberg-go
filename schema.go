@@ -20,6 +20,7 @@ package iceberg
 import (
 	"encoding/json"
 	"fmt"
+	"iter"
 	"maps"
 	"slices"
 	"strings"
@@ -113,6 +114,17 @@ func (s *Schema) lazyNameToID() (map[string]int, error) {
 	s.nameToID.Store(&idx)
 
 	return idx, nil
+}
+
+// FlatFields returns an iterator over the flattened fields in the schema
+// The fields are returned in arbitrary order.
+func (s *Schema) FlatFields() (iter.Seq[NestedField], error) {
+	fields, err := s.lazyIDToField()
+	if err != nil {
+		return nil, err
+	}
+
+	return maps.Values(fields), nil
 }
 
 func (s *Schema) lazyIDToField() (map[int]NestedField, error) {
@@ -475,10 +487,13 @@ type SchemaVisitorPerPrimitiveType[T any] interface {
 	VisitDate() T
 	VisitTime() T
 	VisitTimestamp() T
+	VisitTimestampNs() T
 	VisitTimestampTz() T
+	VisitTimestampNsTz() T
 	VisitString() T
 	VisitBinary() T
 	VisitUUID() T
+	VisitUnknown() T
 }
 
 // Visit accepts a visitor and performs a post-order traversal of the given schema.
@@ -486,7 +501,7 @@ func Visit[T any](sc *Schema, visitor SchemaVisitor[T]) (res T, err error) {
 	if sc == nil {
 		err = fmt.Errorf("%w: cannot visit nil schema", ErrInvalidArgument)
 
-		return
+		return res, err
 	}
 
 	defer func() {
@@ -607,8 +622,12 @@ func visitField[T any](f NestedField, visitor SchemaVisitor[T]) T {
 				return perPrimitive.VisitTime()
 			case TimestampType:
 				return perPrimitive.VisitTimestamp()
+			case TimestampNsType:
+				return perPrimitive.VisitTimestampNs()
 			case TimestampTzType:
 				return perPrimitive.VisitTimestampTz()
+			case TimestampTzNsType:
+				return perPrimitive.VisitTimestampNsTz()
 			case StringType:
 				return perPrimitive.VisitString()
 			case BinaryType:
@@ -619,6 +638,8 @@ func visitField[T any](f NestedField, visitor SchemaVisitor[T]) T {
 				return perPrimitive.VisitDecimal(t)
 			case FixedType:
 				return perPrimitive.VisitFixed(t)
+			case UnknownType:
+				return perPrimitive.VisitUnknown()
 			}
 		}
 
@@ -639,7 +660,7 @@ func PreOrderVisit[T any](sc *Schema, visitor PreOrderSchemaVisitor[T]) (res T, 
 	if sc == nil {
 		err = fmt.Errorf("%w: cannot visit nil schema", ErrInvalidArgument)
 
-		return
+		return res, err
 	}
 
 	defer func() {
@@ -1082,14 +1103,16 @@ func (findLastFieldID) Schema(_ *Schema, result int) int {
 }
 
 func (findLastFieldID) Struct(_ StructType, fieldResults []int) int {
-	return max(fieldResults...)
+	return slices.Max(fieldResults)
 }
 
 func (findLastFieldID) Field(field NestedField, fieldResult int) int {
 	return max(field.ID, fieldResult)
 }
 
-func (findLastFieldID) List(_ ListType, elemResult int) int { return elemResult }
+func (findLastFieldID) List(field ListType, elemResult int) int {
+	return max(field.ElementID, elemResult)
+}
 
 func (findLastFieldID) Map(field MapType, keyResult, valueResult int) int {
 	return max(field.KeyID, field.ValueID, keyResult, valueResult)
@@ -1269,7 +1292,7 @@ func (s *setFreshIDs) Primitive(p PrimitiveType) Type {
 // it is nil then a simple incrementing counter is used starting at 1.
 func AssignFreshSchemaIDs(sc *Schema, nextID func() int) (*Schema, error) {
 	if nextID == nil {
-		var id int = 0
+		id := 0
 		nextID = func() int {
 			id++
 
@@ -1315,13 +1338,13 @@ func VisitSchemaWithPartner[T, P any](sc *Schema, partner P, visitor SchemaWithP
 	if sc == nil {
 		err = fmt.Errorf("%w: cannot visit nil schema", ErrInvalidArgument)
 
-		return
+		return res, err
 	}
 
 	if visitor == nil || accessor == nil {
 		err = fmt.Errorf("%w: cannot visit with nil visitor or accessor", ErrInvalidArgument)
 
-		return
+		return res, err
 	}
 
 	defer func() {
@@ -1482,7 +1505,7 @@ func sanitizeName(n string) string {
 	b.Grow(len(n))
 
 	first := n[0]
-	if !(unicode.IsLetter(rune(first)) || first == '_') {
+	if !unicode.IsLetter(rune(first)) && first != '_' {
 		b.WriteString(sanitize(rune(first)))
 	} else {
 		b.WriteByte(first)

@@ -36,7 +36,7 @@ RC="$2"
 
 ICEBERG_DIST_BASE_URL="https://downloads.apache.org/iceberg"
 DOWNLOAD_RC_BASE_URL="https://dist.apache.org/repos/dist/dev/iceberg/apache-iceberg-go-${VERSION}-rc${RC}"
-ARCHIVE_BASE_NAME="apache-iceberg-go-${VERSION}-rc${RC}"
+ARCHIVE_BASE_NAME="apache-iceberg-go-${VERSION}"
 
 : "${VERIFY_DEFAULT:=1}"
 : "${VERIFY_DOWNLOAD:=${VERIFY_DEFAULT}}"
@@ -120,13 +120,12 @@ latest_go_version() {
     options+=("--header" "Authorization: Bearer ${GITHUB_TOKEN}")
   fi
   curl \
-    "${options[@]}" \
-    https://api.github.com/repos/golang/go/git/matching-refs/tags/go |
-    grep -o '"ref": "refs/tags/go.*"' |
-    tail -n 1 |
-    sed \
-      -e 's,^"ref": "refs/tags/go,,g' \
-      -e 's/"$//g'
+   "${options[@]}" \
+   https://api.github.com/repos/golang/go/git/matching-refs/tags/go |
+  jq -r ' .[] | .ref' |
+  sort -V |
+  tail -1 |
+  sed 's,refs/tags/go,,g'
 }
 
 ensure_go() {
@@ -186,6 +185,10 @@ test_source_distribution() {
   # TODO: run integration tests
 }
 
+run_rat_check() {
+  "${TOP_SOURCE_DIR}/dev/release/run_rat.sh" "${VERIFY_TMPDIR}/${ARCHIVE_BASE_NAME}.tar.gz"
+}
+
 setup_tmpdir "iceberg-go-${VERSION}-${RC}"
 echo "Working in sandbox ${VERIFY_TMPDIR}"
 cd "${VERIFY_TMPDIR}"
@@ -193,6 +196,7 @@ cd "${VERIFY_TMPDIR}"
 import_gpg_keys
 fetch_archive
 ensure_source_directory
+run_rat_check
 ensure_go
 pushd "${ARCHIVE_BASE_NAME}"
 test_source_distribution

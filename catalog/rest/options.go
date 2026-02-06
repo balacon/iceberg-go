@@ -19,6 +19,7 @@ package rest
 
 import (
 	"crypto/tls"
+	"net/http"
 	"net/url"
 
 	"github.com/apache/iceberg-go"
@@ -36,6 +37,18 @@ func WithCredential(cred string) Option {
 func WithOAuthToken(token string) Option {
 	return func(o *options) {
 		o.oauthToken = token
+	}
+}
+
+func WithHeaders(headers map[string]string) Option {
+	return func(o *options) {
+		o.headers = headers
+	}
+}
+
+func WithAuthManager(authManager AuthManager) Option {
+	return func(o *options) {
+		o.authManager = authManager
 	}
 }
 
@@ -108,12 +121,21 @@ func WithAdditionalProps(props iceberg.Properties) Option {
 	}
 }
 
+// WithCustomTransport replaces the internally configured http.Transport with the provided http.RoundTripper.
+// Certain options such as WithTLSConfig which modify the default http.Transport will no longer work since the entire transport is replaced.
+func WithCustomTransport(transport http.RoundTripper) Option {
+	return func(o *options) {
+		o.transport = transport
+	}
+}
+
 type options struct {
 	awsConfig         aws.Config
 	awsConfigSet      bool
 	tlsConfig         *tls.Config
-	credential        string
 	oauthToken        string
+	credential        string
+	authManager       AuthManager
 	warehouseLocation string
 	metadataLocation  string
 	enableSigv4       bool
@@ -122,6 +144,8 @@ type options struct {
 	prefix            string
 	authUri           *url.URL
 	scope             string
+	transport         http.RoundTripper
+	headers           map[string]string
 
 	additionalProps iceberg.Properties
 }

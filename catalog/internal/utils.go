@@ -18,91 +18,72 @@
 package internal
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/url"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/internal"
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
 )
 
-func GetMetadataLoc(location string, newVersion uint) string {
-	return fmt.Sprintf("%s/metadata/%05d-%s.metadata.json",
-		location, newVersion, uuid.New().String())
-}
+func WriteTableMetadata(metadata table.Metadata, fs icebergio.WriteFileIO, loc string, compression string) (err error) {
+	switch compression {
+	case table.MetadataCompressionCodecNone, table.MetadataCompressionCodecGzip:
+		// supported codecs
+	default:
+		return fmt.Errorf("unsupported write metadata compression codec: %s", compression)
+	}
 
-func WriteTableMetadata(metadata table.Metadata, fs io.WriteFileIO, loc string) error {
 	out, err := fs.Create(loc)
 	if err != nil {
-		return nil
+		return err
 	}
-	defer out.Close()
+	defer internal.CheckedClose(out, &err)
 
-	return json.NewEncoder(out).Encode(metadata)
+	var writer io.Writer = out
+	var compressWriter io.WriteCloser
+	if compression == table.MetadataCompressionCodecGzip {
+		compressWriter = gzip.NewWriter(out)
+		writer = compressWriter
+		defer internal.CheckedClose(compressWriter, &err)
+	}
+
+	err = json.NewEncoder(writer).Encode(metadata)
+
+	return
 }
 
 func WriteMetadata(ctx context.Context, metadata table.Metadata, loc string, props iceberg.Properties) error {
-	fs, err := io.LoadFS(ctx, props, loc)
+	fs, err := icebergio.LoadFS(ctx, props, loc)
 	if err != nil {
 		return err
 	}
 
-	wfs, ok := fs.(io.WriteFileIO)
+	wfs, ok := fs.(icebergio.WriteFileIO)
 	if !ok {
 		return errors.New("filesystem IO does not support writing")
 	}
 
-	out, err := wfs.Create(loc)
-	if err != nil {
-		return nil
-	}
+	compression := props.Get(table.MetadataCompressionKey, table.MetadataCompressionDefault)
 
-	defer out.Close()
-
-	return json.NewEncoder(out).Encode(metadata)
+	return WriteTableMetadata(metadata, wfs, loc, compression)
 }
 
 func UpdateTableMetadata(base table.Metadata, updates []table.Update, metadataLoc string) (table.Metadata, error) {
-	bldr, err := table.MetadataBuilderFromBase(base)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, update := range updates {
-		if err := update.Apply(bldr); err != nil {
-			return nil, err
-		}
-	}
-
-	if bldr.HasChanges() {
-		if metadataLoc != "" {
-			maxMetadataLogEntries := max(1,
-				base.Properties().GetInt(
-					table.MetadataPreviousVersionsMaxKey, table.MetadataPreviousVersionsMaxDefault))
-
-			bldr.TrimMetadataLogs(maxMetadataLogEntries + 1).
-				AppendMetadataLog(table.MetadataLogEntry{
-					MetadataFile: metadataLoc,
-					TimestampMs:  base.LastUpdatedMillis(),
-				})
-		}
-		if base.LastUpdatedMillis() == bldr.LastUpdatedMS() {
-			bldr.SetLastUpdatedMS()
-		}
-	}
-
-	return bldr.Build()
+	return table.UpdateTableMetadata(base, updates, metadataLoc)
 }
 
 func CreateStagedTable(ctx context.Context, catprops iceberg.Properties, nspropsFn GetNamespacePropsFn, ident table.Identifier, sc *iceberg.Schema, opts ...catalog.CreateTableOpt) (table.StagedTable, error) {
@@ -143,7 +124,7 @@ func CreateStagedTable(ctx context.Context, catprops iceberg.Properties, nsprops
 			ident,
 			metadata,
 			metadataLoc,
-			io.LoadFSFunc(ioProps, metadataLoc),
+			icebergio.LoadFSFunc(ioProps, metadataLoc),
 			nil,
 		),
 	}, nil
@@ -247,165 +228,8 @@ func UpdateAndStageTable(ctx context.Context, current *table.Table, ident table.
 			ident,
 			updated,
 			newLocation,
-			io.LoadFSFunc(updated.Properties(), newLocation),
+			icebergio.LoadFSFunc(updated.Properties(), newLocation),
 			cat,
 		),
 	}, nil
-}
-
-func CreateViewMetadata(
-	ctx context.Context,
-	catalogName string,
-	nsIdent []string,
-	schema *iceberg.Schema,
-	viewSQL string,
-	loc string,
-	props iceberg.Properties,
-) (metadataLocation string, err error) {
-	versionId := int64(1)
-	timestampMs := time.Now().UnixMilli()
-
-	viewVersion := struct {
-		VersionID       int64             `json:"version-id"`
-		TimestampMs     int64             `json:"timestamp-ms"`
-		SchemaID        int               `json:"schema-id"`
-		Summary         map[string]string `json:"summary"`
-		Operation       string            `json:"operation"`
-		Representations []struct {
-			Type    string `json:"type"`
-			SQL     string `json:"sql"`
-			Dialect string `json:"dialect"`
-		} `json:"representations"`
-		DefaultCatalog   string   `json:"default-catalog"`
-		DefaultNamespace []string `json:"default-namespace"`
-	}{
-		VersionID:   versionId,
-		TimestampMs: timestampMs,
-		SchemaID:    schema.ID,
-		Summary:     map[string]string{"sql": viewSQL},
-		Operation:   "create",
-		Representations: []struct {
-			Type    string `json:"type"`
-			SQL     string `json:"sql"`
-			Dialect string `json:"dialect"`
-		}{
-			{Type: "sql", SQL: viewSQL, Dialect: "default"},
-		},
-		DefaultCatalog:   catalogName,
-		DefaultNamespace: nsIdent,
-	}
-
-	viewVersionBytes, err := json.Marshal(viewVersion)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal view version: %w", err)
-	}
-
-	if props == nil {
-		props = iceberg.Properties{}
-	}
-	props["view-version"] = string(viewVersionBytes)
-	props["view-format"] = "iceberg"
-	props["view-sql"] = viewSQL
-
-	metadataLocation = loc + "/metadata/view-" + uuid.New().String() + ".metadata.json"
-
-	viewUUID := uuid.New().String()
-	props["view-uuid"] = viewUUID
-
-	viewMetadata := map[string]interface{}{
-		"view-uuid":          viewUUID,
-		"format-version":     1,
-		"location":           loc,
-		"schema":             schema,
-		"current-version-id": versionId,
-		"versions": map[string]interface{}{
-			"1": viewVersion,
-		},
-		"properties": props,
-		"version-log": []map[string]interface{}{
-			{
-				"timestamp-ms": timestampMs,
-				"version-id":   versionId,
-			},
-		},
-	}
-
-	viewMetadataBytes, err := json.Marshal(viewMetadata)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal view metadata: %w", err)
-	}
-
-	fs, err := io.LoadFS(ctx, props, metadataLocation)
-	if err != nil {
-		return "", fmt.Errorf("failed to load filesystem for view metadata: %w", err)
-	}
-
-	wfs, ok := fs.(io.WriteFileIO)
-	if !ok {
-		return "", errors.New("filesystem IO does not support writing")
-	}
-
-	out, err := wfs.Create(metadataLocation)
-	if err != nil {
-		return "", fmt.Errorf("failed to create view metadata file: %w", err)
-	}
-	defer out.Close()
-
-	if _, err := out.Write(viewMetadataBytes); err != nil {
-		return "", fmt.Errorf("failed to write view metadata: %w", err)
-	}
-
-	return metadataLocation, nil
-}
-
-func LoadViewMetadata(ctx context.Context,
-	props iceberg.Properties,
-	metadataLocation string,
-	viewName string,
-	namespace string,
-) (map[string]interface{}, error) {
-	// Initial metadata with basic information
-	viewMetadata := map[string]interface{}{
-		"name":              viewName,
-		"namespace":         namespace,
-		"metadata-location": metadataLocation,
-	}
-
-	// Load the filesystem
-	fs, err := io.LoadFS(ctx, props, metadataLocation)
-	if err != nil {
-		return nil, fmt.Errorf("error loading view metadata: %w", err)
-	}
-
-	// Open the metadata file
-	inputFile, err := fs.Open(metadataLocation)
-	if err != nil {
-		return viewMetadata, fmt.Errorf("error encountered loading view metadata: %w", err)
-	}
-	defer inputFile.Close()
-
-	// Decode the complete metadata
-	var fullViewMetadata map[string]interface{}
-	if err := json.NewDecoder(inputFile).Decode(&fullViewMetadata); err != nil {
-		return viewMetadata, fmt.Errorf("error encountered decoding view metadata: %w", err)
-	}
-
-	// Update the metadata with name, namespace and location
-	fullViewMetadata["name"] = viewName
-	fullViewMetadata["namespace"] = namespace
-	fullViewMetadata["metadata-location"] = metadataLocation
-
-	if props, ok := fullViewMetadata["properties"].(map[string]interface{}); ok {
-		strProps := make(map[string]string)
-		for k, v := range props {
-			if str, ok := v.(string); ok {
-				strProps[k] = str
-			} else if vJson, err := json.Marshal(v); err == nil {
-				strProps[k] = string(vJson)
-			}
-		}
-		fullViewMetadata["properties"] = strProps
-	}
-
-	return fullViewMetadata, nil
 }

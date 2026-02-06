@@ -125,7 +125,7 @@ func (sp *SnapshotProducer) EdeleteDataFile(df iceberg.DataFile) *SnapshotProduc
 
 type CountingWriter = internal.CountingWriter
 
-func (sp *SnapshotProducer) EnewManifestWriter(spec iceberg.PartitionSpec) (*iceberg.ManifestWriter, string, *CountingWriter, error) {
+func (sp *SnapshotProducer) EnewManifestWriter(spec iceberg.PartitionSpec) (*iceberg.ManifestWriter, string, *CountingWriter, io.Closer, error) {
 	return sp.newManifestWriter(spec)
 }
 

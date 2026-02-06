@@ -81,13 +81,11 @@ func (s *AzureBlobIOTestSuite) TestAzureBlobWarehouseKey() {
 		catalog.ToIdentifier("iceberg-test-azure", "test-table-azure"),
 		iceberg.NewSchema(0, iceberg.NestedField{
 			Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, ID: 1,
-		}), catalog.WithLocation(fmt.Sprintf("abfs://%s/iceberg/%s", containerName, path)))
+		}), catalog.WithLocation(fmt.Sprintf("abfs://%s@%s.dfs.core.windows.net/iceberg/%s", containerName, accountName, path)))
 	s.Require().NoError(err)
 	s.Require().NotNil(tbl)
 
-	tbl, err = c.LoadTable(s.ctx,
-		catalog.ToIdentifier("iceberg-test-azure", "test-table-azure"),
-		properties)
+	tbl, err = c.LoadTable(s.ctx, catalog.ToIdentifier("iceberg-test-azure", "test-table-azure"))
 	s.Require().NoError(err)
 	s.Require().NotNil(tbl)
 }
@@ -97,11 +95,10 @@ func (s *AzureBlobIOTestSuite) TestAzuriteWarehouseConnectionString() {
 	path := "iceberg-test-azure/test-table-azure"
 	containerName := "warehouse"
 	properties := iceberg.Properties{
-		"uri":                       ":memory:",
-		sqlcat.DriverKey:            sqliteshim.ShimName,
-		sqlcat.DialectKey:           string(sqlcat.SQLite),
-		"type":                      "sql",
-		io.AdlsSharedKeyAccountName: accountName,
+		"uri":             ":memory:",
+		sqlcat.DriverKey:  sqliteshim.ShimName,
+		sqlcat.DialectKey: string(sqlcat.SQLite),
+		"type":            "sql",
 		io.AdlsConnectionStringPrefix + accountName: connectionString,
 	}
 
@@ -116,13 +113,11 @@ func (s *AzureBlobIOTestSuite) TestAzuriteWarehouseConnectionString() {
 		catalog.ToIdentifier("iceberg-test-azure", "test-table-azure"),
 		iceberg.NewSchema(0, iceberg.NestedField{
 			Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, ID: 1,
-		}), catalog.WithLocation(fmt.Sprintf("wasb://%s/iceberg/%s", containerName, path)))
+		}), catalog.WithLocation(fmt.Sprintf("abfs://%s@%s.dfs.core.windows.net/iceberg/%s", containerName, accountName, path)))
 	s.Require().NoError(err)
 	s.Require().NotNil(tbl)
 
-	tbl, err = c.LoadTable(s.ctx,
-		catalog.ToIdentifier("iceberg-test-azure", "test-table-azure"),
-		properties)
+	tbl, err = c.LoadTable(s.ctx, catalog.ToIdentifier("iceberg-test-azure", "test-table-azure"))
 	s.Require().NoError(err)
 	s.Require().NotNil(tbl)
 }

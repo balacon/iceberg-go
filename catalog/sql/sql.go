@@ -34,6 +34,7 @@ import (
 	"github.com/apache/iceberg-go/catalog/internal"
 	"github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/view"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/feature"
 	"github.com/uptrace/bun/dialect/mssqldialect"
@@ -153,13 +154,13 @@ type sqlIcebergNamespaceProps struct {
 }
 
 func withReadTx[R any](ctx context.Context, db *bun.DB, fn func(context.Context, bun.Tx) (R, error)) (result R, err error) {
-	db.RunInTx(ctx, &sql.TxOptions{ReadOnly: true}, func(ctx context.Context, tx bun.Tx) error {
+	err = db.RunInTx(ctx, &sql.TxOptions{ReadOnly: true}, func(ctx context.Context, tx bun.Tx) error {
 		result, err = fn(ctx, tx)
 
 		return err
 	})
 
-	return
+	return result, err
 }
 
 func withWriteTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.Tx) error) error {
@@ -298,7 +299,8 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 		return nil, errors.New("loaded filesystem IO does not support writing")
 	}
 
-	if err := internal.WriteTableMetadata(staged.Metadata(), wfs, staged.MetadataLocation()); err != nil {
+	compression := staged.Table.Properties().Get(table.MetadataCompressionKey, table.MetadataCompressionDefault)
+	if err := internal.WriteTableMetadata(staged.Metadata(), wfs, staged.MetadataLocation(), compression); err != nil {
 		return nil, err
 	}
 
@@ -320,19 +322,19 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 		return nil, err
 	}
 
-	return c.LoadTable(ctx, ident, staged.Properties())
+	return c.LoadTable(ctx, ident)
 }
 
-func (c *Catalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
-	ns := catalog.NamespaceFromIdent(tbl.Identifier())
-	tblName := catalog.TableNameFromIdent(tbl.Identifier())
+func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	ns := catalog.NamespaceFromIdent(ident)
+	tblName := catalog.TableNameFromIdent(ident)
 
-	current, err := c.LoadTable(ctx, tbl.Identifier(), nil)
+	current, err := c.LoadTable(ctx, ident)
 	if err != nil && !errors.Is(err, catalog.ErrNoSuchTable) {
 		return nil, "", err
 	}
 
-	staged, err := internal.UpdateAndStageTable(ctx, current, tbl.Identifier(), reqs, updates, c)
+	staged, err := internal.UpdateAndStageTable(ctx, current, ident, reqs, updates, c)
 	if err != nil {
 		return nil, "", err
 	}
@@ -394,13 +396,9 @@ func (c *Catalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []tabl
 	return staged.Metadata(), staged.MetadataLocation(), nil
 }
 
-func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, props iceberg.Properties) (*table.Table, error) {
+func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier) (*table.Table, error) {
 	ns := catalog.NamespaceFromIdent(identifier)
 	tbl := catalog.TableNameFromIdent(identifier)
-
-	if props == nil {
-		props = iceberg.Properties{}
-	}
 
 	result, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
 		t := new(sqlIcebergTable)
@@ -427,14 +425,11 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 		return nil, fmt.Errorf("%w: %s, metadata location is missing", catalog.ErrNoSuchTable, identifier)
 	}
 
-	tblProps := maps.Clone(c.props)
-	maps.Copy(props, tblProps)
-
 	return table.NewFromLocation(
 		ctx,
 		identifier,
 		result.MetadataLocation.String,
-		io.LoadFSFunc(tblProps, result.MetadataLocation.String),
+		io.LoadFSFunc(c.props, result.MetadataLocation.String),
 		c,
 	)
 }
@@ -522,11 +517,11 @@ func (c *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (*
 		return nil, err
 	}
 
-	return c.LoadTable(ctx, to, nil)
+	return c.LoadTable(ctx, to)
 }
 
 func (c *Catalog) CheckTableExists(ctx context.Context, identifier table.Identifier) (bool, error) {
-	_, err := c.LoadTable(ctx, identifier, nil)
+	_, err := c.LoadTable(ctx, identifier)
 	if err != nil {
 		if errors.Is(err, catalog.ErrNoSuchTable) {
 			return false, nil
@@ -853,10 +848,12 @@ func (c *Catalog) CreateView(ctx context.Context, identifier table.Identifier, s
 		return err
 	}
 
-	metadataLocation, err := internal.CreateViewMetadata(ctx, c.name, nsIdent, schema, viewSQL, loc, props)
+	createdView, err := view.CreateView(ctx, c.name, identifier, schema, viewSQL, nsIdent, loc, props)
 	if err != nil {
 		return err
 	}
+	metadataLocation := createdView.MetadataLocation()
+
 	err = withWriteTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
 		_, err := tx.NewInsert().Model(&sqlIcebergTable{
 			CatalogName:      c.name,
@@ -986,7 +983,7 @@ func (c *Catalog) DropView(ctx context.Context, identifier table.Identifier) err
 	if metadataLocation != "" {
 		fs, err := io.LoadFS(ctx, c.props, metadataLocation)
 		if err != nil {
-			return nil
+			return err
 		}
 
 		_ = fs.Remove(metadataLocation)
@@ -1015,11 +1012,11 @@ func (c *Catalog) CheckViewExists(ctx context.Context, identifier table.Identifi
 }
 
 // LoadView loads a view from the catalog.
-func (c *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (map[string]interface{}, error) {
+func (c *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (view.Metadata, error) {
 	ns := strings.Join(catalog.NamespaceFromIdent(identifier), ".")
 	viewName := catalog.TableNameFromIdent(identifier)
 
-	view, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
+	v, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
 		v := new(sqlIcebergTable)
 		err := tx.NewSelect().Model(v).
 			Where("catalog_name = ?", c.name).
@@ -1040,14 +1037,14 @@ func (c *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (ma
 		return nil, err
 	}
 
-	if !view.MetadataLocation.Valid {
+	if !v.MetadataLocation.Valid {
 		return nil, fmt.Errorf("%w: %s, metadata location is missing", catalog.ErrNoSuchView, identifier)
 	}
 
-	viewMetadata, err := internal.LoadViewMetadata(ctx, c.props, view.MetadataLocation.String, viewName, ns)
+	loadedView, err := view.NewFromLocation(ctx, identifier, v.MetadataLocation.String, io.LoadFSFunc(c.props, v.MetadataLocation.String))
 	if err != nil {
 		return nil, err
 	}
 
-	return viewMetadata, nil
+	return loadedView.Metadata(), nil
 }

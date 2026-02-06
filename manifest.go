@@ -23,12 +23,14 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"reflect"
 	"slices"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/google/uuid"
@@ -179,7 +181,7 @@ type manifestFileV1 struct {
 }
 
 func (m *manifestFileV1) toFile() *manifestFile {
-	m.manifestFile.version = 1
+	m.version = 1
 	m.Content = ManifestContentData
 	m.SeqNumber, m.MinSeqNumber = initialSequenceNumber, initialSequenceNumber
 
@@ -321,6 +323,7 @@ type manifestFile struct {
 	DeletedRowsCount   int64           `avro:"deleted_rows_count"`
 	PartitionList      *[]FieldSummary `avro:"partitions"`
 	Key                []byte          `avro:"key_metadata"`
+	FirstRowId         *int64          `avro:"first_row_id"`
 
 	version int `avro:"-"`
 }
@@ -403,7 +406,7 @@ func (m *manifestFile) FetchEntries(fs iceio.IO, discardDeleted bool) ([]Manifes
 	return fetchManifestEntries(m, fs, discardDeleted)
 }
 
-func getFieldIDMap(sc avro.Schema) (map[string]int, map[int]avro.LogicalType) {
+func getFieldIDMap(sc avro.Schema) (map[string]int, map[int]avro.LogicalType, map[int]int) {
 	getField := func(rs *avro.RecordSchema, name string) *avro.Field {
 		for _, f := range rs.Fields() {
 			if f.Name() == name {
@@ -416,38 +419,53 @@ func getFieldIDMap(sc avro.Schema) (map[string]int, map[int]avro.LogicalType) {
 
 	result := make(map[string]int)
 	logicalTypes := make(map[int]avro.LogicalType)
+	fixedSizes := make(map[int]int)
+
 	entryField := getField(sc.(*avro.RecordSchema), "data_file")
 	partitionField := getField(entryField.Type().(*avro.RecordSchema), "partition")
 
 	for _, field := range partitionField.Type().(*avro.RecordSchema).Fields() {
-		if fid, ok := field.Prop("field-id").(float64); ok {
-			result[field.Name()] = int(fid)
-			avroTyp := field.Type()
-			if us, ok := avroTyp.(*avro.UnionSchema); ok {
-				for _, t := range us.Types() {
-					avroTyp = t
-				}
-			}
-			if ps, ok := avroTyp.(*avro.PrimitiveSchema); ok && ps.Logical() != nil {
-				logicalTypes[int(fid)] = ps.Logical().Type()
+		var fid int
+		switch v := field.Prop("field-id").(type) {
+		case int:
+			fid = v
+		case float64:
+			fid = int(v)
+		default:
+			continue
+		}
+
+		result[field.Name()] = fid
+		avroTyp := field.Type()
+		if us, ok := avroTyp.(*avro.UnionSchema); ok {
+			typeList := us.Types()
+			avroTyp = typeList[len(typeList)-1]
+		}
+		if ps, ok := avroTyp.(*avro.PrimitiveSchema); ok && ps.Logical() != nil {
+			logicalTypes[fid] = ps.Logical().Type()
+		} else if fs, ok := avroTyp.(*avro.FixedSchema); ok && fs.Logical() != nil {
+			logicalTypes[int(fid)] = fs.Logical().Type()
+			if decimalLogical, ok := fs.Logical().(*avro.DecimalLogicalSchema); ok {
+				fixedSizes[int(fid)] = decimalLogical.Scale()
 			}
 		}
 	}
 
-	return result, logicalTypes
+	return result, logicalTypes, fixedSizes
 }
 
 type hasFieldToIDMap interface {
 	setFieldNameToIDMap(map[string]int)
 	setFieldIDToLogicalTypeMap(map[int]avro.LogicalType)
+	setFieldIDToFixedSizeMap(map[int]int)
 }
 
-func fetchManifestEntries(m ManifestFile, fs iceio.IO, discardDeleted bool) ([]ManifestEntry, error) {
+func fetchManifestEntries(m ManifestFile, fs iceio.IO, discardDeleted bool) (_ []ManifestEntry, err error) {
 	f, err := fs.Open(m.FilePath())
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer internal.CheckedClose(f, &err)
 
 	return ReadManifest(m, f, discardDeleted)
 }
@@ -569,6 +587,7 @@ type ManifestReader struct {
 	content       ManifestContent
 	fieldNameToID map[string]int
 	fieldIDToType map[int]avro.LogicalType
+	fieldIDToSize map[int]int
 
 	// The rest are lazily populated, on demand. Most readers
 	// will likely only try to load the entries.
@@ -601,6 +620,13 @@ func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error)
 
 	var content ManifestContent
 	switch contentStr := string(metadata["content"]); contentStr {
+	case "":
+		if formatVersion != 1 {
+			return nil, fmt.Errorf("manifest file's 'content' metadata is missing and 'format-version' is %d, but the field is required for 'format-version' 2 and beyond",
+				formatVersion)
+		}
+		// V1 manifests do not contain the 'content' field, but should be interpretted as 'data' files
+		fallthrough
 	case "data":
 		content = ManifestContentData
 	case "deletes":
@@ -626,7 +652,7 @@ func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error)
 			}
 		}
 	}
-	fieldNameToID, fieldIDToType := getFieldIDMap(sc)
+	fieldNameToID, fieldIDToType, fieldIDToSize := getFieldIDMap(sc)
 
 	return &ManifestReader{
 		dec:           dec,
@@ -636,6 +662,7 @@ func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error)
 		content:       content,
 		fieldNameToID: fieldNameToID,
 		fieldIDToType: fieldIDToType,
+		fieldIDToSize: fieldIDToSize,
 	}, nil
 }
 
@@ -740,6 +767,7 @@ func (c *ManifestReader) ReadEntry() (ManifestEntry, error) {
 	if fieldToIDMap, ok := tmp.DataFile().(hasFieldToIDMap); ok {
 		fieldToIDMap.setFieldNameToIDMap(c.fieldNameToID)
 		fieldToIDMap.setFieldIDToLogicalTypeMap(c.fieldIDToType)
+		fieldToIDMap.setFieldIDToFixedSizeMap(c.fieldIDToSize)
 	}
 
 	return tmp, nil
@@ -847,6 +875,22 @@ func (v2writerImpl) prepareEntry(entry *manifestEntry, snapshotID int64) (Manife
 	return entry, nil
 }
 
+type v3writerImpl struct{}
+
+func (v3writerImpl) content() ManifestContent { return ManifestContentData }
+func (v3writerImpl) prepareEntry(entry *manifestEntry, snapshotID int64) (ManifestEntry, error) {
+	if entry.SeqNum == nil {
+		if entry.Snapshot != nil && *entry.Snapshot != snapshotID {
+			return nil, fmt.Errorf("found unassigned sequence number for entry from snapshot: %d", entry.SnapshotID())
+		}
+		if entry.EntryStatus != EntryStatusADDED {
+			return nil, errors.New("only entries with status ADDED can be missing a sequence number")
+		}
+	}
+
+	return entry, nil
+}
+
 type fieldStats interface {
 	toSummary() FieldSummary
 	update(value any) error
@@ -863,6 +907,8 @@ type partitionFieldStats[T LiteralType] struct {
 
 func newPartitionFieldStat(typ PrimitiveType) (fieldStats, error) {
 	switch typ.(type) {
+	case BooleanType:
+		return &partitionFieldStats[bool]{cmp: getComparator[bool]()}, nil
 	case Int32Type:
 		return &partitionFieldStats[int32]{cmp: getComparator[int32]()}, nil
 	case Int64Type:
@@ -878,6 +924,8 @@ func newPartitionFieldStat(typ PrimitiveType) (fieldStats, error) {
 	case TimeType:
 		return &partitionFieldStats[Time]{cmp: getComparator[Time]()}, nil
 	case TimestampType:
+		return &partitionFieldStats[Timestamp]{cmp: getComparator[Timestamp]()}, nil
+	case TimestampTzType:
 		return &partitionFieldStats[Timestamp]{cmp: getComparator[Timestamp]()}, nil
 	case UUIDType:
 		return &partitionFieldStats[uuid.UUID]{cmp: getComparator[uuid.UUID]()}, nil
@@ -923,7 +971,7 @@ func (p *partitionFieldStats[T]) update(value any) (err error) {
 	if value == nil {
 		p.containsNull = true
 
-		return
+		return err
 	}
 
 	var actualVal T
@@ -939,13 +987,13 @@ func (p *partitionFieldStats[T]) update(value any) (err error) {
 		if math.IsNaN(float64(f)) {
 			p.containsNan = true
 
-			return
+			return err
 		}
 	case float64:
 		if math.IsNaN(f) {
 			p.containsNan = true
 
-			return
+			return err
 		}
 	}
 
@@ -983,7 +1031,9 @@ func constructPartitionSummaries(spec PartitionSpec, schema *Schema, partitions 
 
 	for _, part := range partitions {
 		for i, field := range partType.FieldList {
-			fieldStats[i].update(part[field.ID])
+			if err := fieldStats[i].update(part[field.ID]); err != nil {
+				return nil, fmt.Errorf("error updating field stats for partition %d: %s: %s", i, field.Name, err)
+			}
 		}
 	}
 
@@ -1006,6 +1056,9 @@ type ManifestWriter struct {
 	spec   PartitionSpec
 	schema *Schema
 
+	partFieldNameToID map[string]int
+	partFieldIDToType map[int]avro.LogicalType
+
 	snapshotID    int64
 	addedFiles    int32
 	addedRows     int64
@@ -1027,6 +1080,8 @@ func NewManifestWriter(version int, out io.Writer, spec PartitionSpec, schema *S
 		impl = v1writerImpl{}
 	case 2:
 		impl = v2writerImpl{}
+	case 3:
+		impl = v3writerImpl{}
 	default:
 		return nil, fmt.Errorf("unsupported manifest version: %d", version)
 	}
@@ -1041,15 +1096,19 @@ func NewManifestWriter(version int, out io.Writer, spec PartitionSpec, schema *S
 		return nil, err
 	}
 
+	nameToID, idToType, _ := getFieldIDMap(fileSchema)
+
 	w := &ManifestWriter{
-		impl:       impl,
-		version:    version,
-		output:     out,
-		spec:       spec,
-		schema:     schema,
-		snapshotID: snapshotID,
-		minSeqNum:  -1,
-		partitions: make([]map[int]any, 0),
+		impl:              impl,
+		version:           version,
+		output:            out,
+		spec:              spec,
+		schema:            schema,
+		partFieldNameToID: nameToID,
+		partFieldIDToType: idToType,
+		snapshotID:        snapshotID,
+		minSeqNum:         -1,
+		partitions:        make([]map[int]any, 0),
 	}
 
 	md, err := w.meta()
@@ -1162,7 +1221,28 @@ func (w *ManifestWriter) addEntry(entry *manifestEntry) error {
 		return fmt.Errorf("unknown entry status: %v", entry.Status())
 	}
 
-	w.partitions = append(w.partitions, entry.DataFile().Partition())
+	if setter, ok := entry.DataFile().(hasFieldToIDMap); ok {
+		setter.setFieldNameToIDMap(w.partFieldNameToID)
+		setter.setFieldIDToLogicalTypeMap(w.partFieldIDToType)
+	}
+
+	w.partitions = append(w.partitions, entry.Data.Partition())
+	partitionData := avroPartitionData(entry.Data.Partition(), w.partFieldIDToType)
+
+	if dataFile, ok := entry.DataFile().(*extendedDataFile); ok {
+		convertedPartitionData := make(map[string]any)
+		for fieldID, convertedValue := range partitionData {
+			for fieldName, id := range w.partFieldNameToID {
+				if id == fieldID {
+					convertedPartitionData[fieldName] = convertedValue
+
+					break
+				}
+			}
+		}
+		dataFile.PartitionData = convertedPartitionData
+	}
+
 	if (entry.Status() == EntryStatusADDED || entry.Status() == EntryStatusEXISTING) &&
 		entry.SequenceNum() > 0 && (w.minSeqNum < 0 || entry.SequenceNum() < w.minSeqNum) {
 		w.minSeqNum = entry.SequenceNum()
@@ -1201,6 +1281,7 @@ type ManifestListWriter struct {
 	commitSnapshotID int64
 	sequenceNumber   int64
 	writer           *ocf.Encoder
+	nextRowID        *int64
 }
 
 func NewManifestListWriterV1(out io.Writer, snapshotID int64, parentSnapshot *int64) (*ManifestListWriter, error) {
@@ -1244,6 +1325,28 @@ func NewManifestListWriterV2(out io.Writer, snapshotID, sequenceNumber int64, pa
 	})
 }
 
+func NewManifestListWriterV3(out io.Writer, snapshotId, sequenceNumber, firstRowID int64, parentSnapshot *int64) (*ManifestListWriter, error) {
+	m := &ManifestListWriter{
+		version:          3,
+		out:              out,
+		commitSnapshotID: snapshotId,
+		sequenceNumber:   sequenceNumber,
+		nextRowID:        &firstRowID,
+	}
+	parentSnapshotStr := "null"
+	if parentSnapshot != nil {
+		parentSnapshotStr = strconv.Itoa(int(*parentSnapshot))
+	}
+
+	return m, m.init(map[string][]byte{
+		"format-version":     []byte(strconv.Itoa(m.version)),
+		"snapshot-id":        []byte(strconv.Itoa(int(snapshotId))),
+		"sequence-number":    []byte(strconv.Itoa(int(sequenceNumber))),
+		"first-row-id":       []byte(strconv.Itoa(int(firstRowID))),
+		"parent-snapshot-id": []byte(parentSnapshotStr),
+	})
+}
+
 func (m *ManifestListWriter) init(meta map[string][]byte) error {
 	fileSchema, err := internal.NewManifestFileSchema(m.version)
 	if err != nil {
@@ -1272,6 +1375,10 @@ func (m *ManifestListWriter) Close() error {
 	return m.writer.Close()
 }
 
+func (m *ManifestListWriter) NextRowID() *int64 {
+	return m.nextRowID
+}
+
 func (m *ManifestListWriter) AddManifests(files []ManifestFile) error {
 	if len(files) == 0 {
 		return nil
@@ -1293,13 +1400,22 @@ func (m *ManifestListWriter) AddManifests(files []ManifestFile) error {
 			}
 		}
 
-	case 2:
+	case 2, 3:
 		for _, file := range files {
-			if file.Version() != 2 {
-				return fmt.Errorf("%w: ManifestListWriter only supports version 2 manifest files", ErrInvalidArgument)
+			if file.Version() != m.version {
+				return fmt.Errorf("%w: ManifestListWriter only supports version %d manifest files", ErrInvalidArgument, m.version)
 			}
 
 			wrapped := *(file.(*manifestFile))
+			if m.version == 3 {
+				// Ref: https://github.com/apache/iceberg/blob/ea2071568dc66148b483a82eefedcd2992b435f7/core/src/main/java/org/apache/iceberg/ManifestListWriter.java#L157-L168
+				if wrapped.Content == ManifestContentData && wrapped.FirstRowId == nil {
+					if m.nextRowID != nil {
+						wrapped.FirstRowId = m.nextRowID
+						*m.nextRowID += wrapped.ExistingRowsCount + wrapped.AddedRowsCount
+					}
+				}
+			}
 			if wrapped.SeqNumber == -1 {
 				// if the sequence number is being assigned here,
 				// then the manifest must be created by the current
@@ -1333,11 +1449,8 @@ func (m *ManifestListWriter) AddManifests(files []ManifestFile) error {
 }
 
 // WriteManifestList writes a list of manifest files to an avro file.
-func WriteManifestList(version int, out io.Writer, snapshotID int64, parentSnapshotID, sequenceNumber *int64, files []ManifestFile) error {
-	var (
-		writer *ManifestListWriter
-		err    error
-	)
+func WriteManifestList(version int, out io.Writer, snapshotID int64, parentSnapshotID, sequenceNumber *int64, firstRowId int64, files []ManifestFile) (err error) {
+	var writer *ManifestListWriter
 
 	switch version {
 	case 1:
@@ -1347,6 +1460,11 @@ func WriteManifestList(version int, out io.Writer, snapshotID int64, parentSnaps
 			return errors.New("sequence number is required for V2 tables")
 		}
 		writer, err = NewManifestListWriterV2(out, snapshotID, *sequenceNumber, parentSnapshotID)
+	case 3:
+		if sequenceNumber == nil {
+			return errors.New("sequence number is required for V3 tables")
+		}
+		writer, err = NewManifestListWriterV3(out, snapshotID, *sequenceNumber, firstRowId, parentSnapshotID)
 	default:
 		return fmt.Errorf("unsupported manifest version: %d", version)
 	}
@@ -1354,12 +1472,9 @@ func WriteManifestList(version int, out io.Writer, snapshotID int64, parentSnaps
 	if err != nil {
 		return err
 	}
+	defer internal.CheckedClose(writer, &err)
 
-	if err = writer.AddManifests(files); err != nil {
-		return err
-	}
-
-	return writer.Close()
+	return writer.AddManifests(files)
 }
 
 func WriteManifest(
@@ -1370,13 +1485,14 @@ func WriteManifest(
 	schema *Schema,
 	snapshotID int64,
 	entries []ManifestEntry,
-) (ManifestFile, error) {
+) (mf ManifestFile, err error) {
 	cnt := &internal.CountingWriter{W: out}
 
 	w, err := NewManifestWriter(version, cnt, spec, schema, snapshotID)
 	if err != nil {
 		return nil, err
 	}
+	defer internal.CheckedClose(w, &err)
 
 	for _, entry := range entries {
 		if err := w.addEntry(entry.(*manifestEntry)); err != nil {
@@ -1470,48 +1586,138 @@ func avroPartitionData(input map[int]any, logicalTypes map[int]avro.LogicalType)
 	out := make(map[int]any)
 	for k, v := range input {
 		if logical, ok := logicalTypes[k]; ok {
-			switch logical {
-			case avro.Date:
-				out[k] = Date(v.(time.Time).Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds()))
-			case avro.TimeMillis:
-				out[k] = Time(v.(time.Duration).Milliseconds())
-			case avro.TimeMicros:
-				out[k] = Time(v.(time.Duration).Microseconds())
-			case avro.TimestampMillis:
-				out[k] = Timestamp(v.(time.Time).UTC().UnixMilli())
-			case avro.TimestampMicros:
-				out[k] = Timestamp(v.(time.Time).UTC().UnixMicro())
-			default:
-				out[k] = v
-			}
-
-			continue
+			out[k] = convertLogicalTypeValue(v, logical)
+		} else {
+			out[k] = v
 		}
-		out[k] = v
 	}
 
 	return out
 }
 
+func convertLogicalTypeValue(v any, logicalType avro.LogicalType) any {
+	switch logicalType {
+	case avro.Date:
+		return convertDateValue(v)
+	case avro.TimeMicros:
+		return convertTimeMicrosValue(v)
+	case avro.TimestampMicros:
+		return convertTimestampMicrosValue(v)
+	case avro.Decimal:
+		return convertDecimalValue(v)
+	case avro.UUID:
+		return convertUUIDValue(v)
+	default:
+		return v
+	}
+}
+
+func convertDateValue(v any) any {
+	if v == nil {
+		return map[string]any{"null": nil}
+	}
+
+	if d, ok := v.(Date); ok {
+		return map[string]any{"int.date": int32(d)}
+	}
+
+	return v
+}
+
+func convertTimeMicrosValue(v any) any {
+	if v == nil {
+		return map[string]any{"null": nil}
+	}
+
+	if t, ok := v.(Time); ok {
+		return map[string]any{"long.time-micros": int64(t)}
+	}
+
+	return v
+}
+
+func convertTimestampMicrosValue(v any) any {
+	if v == nil {
+		return map[string]any{"null": nil}
+	}
+
+	if ts, ok := v.(Timestamp); ok {
+		return map[string]any{"long.timestamp-micros": int64(ts)}
+	}
+
+	return v
+}
+
+func convertDecimalValue(v any) any {
+	if v == nil {
+		return map[string]any{"null": nil}
+	}
+
+	if dec, ok := v.(Decimal); ok {
+		fixedSize := internal.DecimalRequiredBytes(len(dec.String()))
+		bytes, err := DecimalLiteral(dec).MarshalBinary()
+		if err != nil {
+			return v
+		}
+		fixedArray := convertToFixedArray(padOrTruncateBytes(bytes, fixedSize), fixedSize)
+
+		return map[string]any{"fixed": fixedArray}
+	}
+
+	return v
+}
+
+func convertUUIDValue(v any) any {
+	if v == nil {
+		return map[string]any{"null": nil}
+	}
+
+	if uuidVal, ok := v.(uuid.UUID); ok {
+		return map[string]any{"uuid": [16]byte(uuidVal)}
+	}
+
+	return v
+}
+
+func padOrTruncateBytes(bytes []byte, size int) []byte {
+	if len(bytes) >= size {
+		return bytes[len(bytes)-size:]
+	}
+	padded := slices.Grow(bytes, size-len(bytes))
+
+	return append(make([]byte, size-len(bytes)), padded...)
+}
+
+func convertToFixedArray(bytes []byte, size int) any {
+	arr := reflect.New(reflect.ArrayOf(size, reflect.TypeOf(byte(0)))).Elem()
+	reflect.Copy(arr, reflect.ValueOf(bytes))
+
+	return arr.Interface()
+}
+
 type dataFileImm struct {
-	Content          ManifestEntryContent   `avro:"content"`
-	Path             string                 `avro:"file_path"`
-	Format           FileFormat             `avro:"file_format"`
-	PartitionData    map[string]any         `avro:"partition"`
-	RecordCount      int64                  `avro:"record_count"`
-	FileSize         int64                  `avro:"file_size_in_bytes"`
-	BlockSizeInBytes int64                  `avro:"block_size_in_bytes"`
-	ColSizes         *[]colMap[int, int64]  `avro:"column_sizes"`
-	ValCounts        *[]colMap[int, int64]  `avro:"value_counts"`
-	NullCounts       *[]colMap[int, int64]  `avro:"null_value_counts"`
-	NaNCounts        *[]colMap[int, int64]  `avro:"nan_value_counts"`
-	DistinctCounts   *[]colMap[int, int64]  `avro:"distinct_counts"`
-	LowerBounds      *[]colMap[int, []byte] `avro:"lower_bounds"`
-	UpperBounds      *[]colMap[int, []byte] `avro:"upper_bounds"`
-	Key              *[]byte                `avro:"key_metadata"`
-	Splits           *[]int64               `avro:"split_offsets"`
-	EqualityIDs      *[]int                 `avro:"equality_ids"`
-	SortOrder        *int                   `avro:"sort_order_id"`
+	Content                 ManifestEntryContent   `avro:"content"`
+	Path                    string                 `avro:"file_path"`
+	Format                  FileFormat             `avro:"file_format"`
+	PartitionData           map[string]any         `avro:"partition"`
+	RecordCount             int64                  `avro:"record_count"`
+	FileSize                int64                  `avro:"file_size_in_bytes"`
+	BlockSizeInBytes        int64                  `avro:"block_size_in_bytes"`
+	ColSizes                *[]colMap[int, int64]  `avro:"column_sizes"`
+	ValCounts               *[]colMap[int, int64]  `avro:"value_counts"`
+	NullCounts              *[]colMap[int, int64]  `avro:"null_value_counts"`
+	NaNCounts               *[]colMap[int, int64]  `avro:"nan_value_counts"`
+	DistinctCounts          *[]colMap[int, int64]  `avro:"distinct_counts"`
+	LowerBounds             *[]colMap[int, []byte] `avro:"lower_bounds"`
+	UpperBounds             *[]colMap[int, []byte] `avro:"upper_bounds"`
+	Key                     *[]byte                `avro:"key_metadata"`
+	Splits                  *[]int64               `avro:"split_offsets"`
+	EqualityIDs             *[]int                 `avro:"equality_ids"`
+	SortOrder               *int                   `avro:"sort_order_id"`
+	FirstRowIDField         *int64                 `avro:"first_row_id"`
+	ReferencedDataFileField *string                `avro:"referenced_data_file"`
+	ContentOffsetField      *int64                 `avro:"content_offset"`
+	ContentSizeInBytesField *int64                 `avro:"content_size_in_bytes"`
 
 	colSizeMap     map[int]int64
 	valCntMap      map[int]int64
@@ -1525,13 +1731,14 @@ type dataFileImm struct {
 	fieldNameToID          map[string]int
 	fieldIDToLogicalType   map[int]avro.LogicalType
 	fieldIDToPartitionData map[int]any
+	fieldIDToFixedSize     map[int]int
 
 	initMaps sync.Once
 }
 
 type extendedDataFile struct {
 	*dataFileImm
-	specID   int32
+	specID int32
 }
 
 func (e extendedDataFile) MarshalAvro() ([]byte, error) {
@@ -1561,18 +1768,87 @@ func (d *dataFileImm) initializeMapData() {
 			d.fieldIDToPartitionData = make(map[int]any, len(d.PartitionData))
 			for k, v := range d.PartitionData {
 				if id, ok := d.fieldNameToID[k]; ok {
-					d.fieldIDToPartitionData[id] = v
+					convertedValue := d.convertAvroValueToIcebergType(v, id)
+					d.fieldIDToPartitionData[id] = convertedValue
 				}
 			}
 		}
-		d.fieldIDToPartitionData = avroPartitionData(d.fieldIDToPartitionData, d.fieldIDToLogicalType)
 	})
+}
+
+func (d *dataFileImm) convertAvroValueToIcebergType(v any, fieldID int) any {
+	if logicalType, ok := d.fieldIDToLogicalType[fieldID]; ok {
+		switch logicalType {
+		case avro.Date:
+			if val, ok := v.(time.Time); ok {
+				return Date(val.Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds()))
+			}
+
+			return Date(v.(int32))
+		case avro.TimeMillis:
+			if val, ok := v.(time.Duration); ok {
+				return Time(val.Milliseconds())
+			}
+
+			return Time(v.(int64))
+		case avro.TimeMicros:
+			if val, ok := v.(time.Duration); ok {
+				return Time(val.Microseconds())
+			}
+
+			return Time(v.(int64))
+		case avro.TimestampMillis:
+			if val, ok := v.(time.Time); ok {
+				return Timestamp(val.UTC().UnixMilli())
+			}
+
+			return Timestamp(v.(int64))
+		case avro.TimestampMicros:
+			if val, ok := v.(time.Time); ok {
+				return Timestamp(val.UTC().UnixMicro())
+			}
+
+			return Timestamp(v.(int64))
+		case avro.Decimal:
+			if unionMap, ok := v.(map[string]any); ok {
+				if val, ok := unionMap["fixed"]; ok {
+					if bigRatValue, ok := val.(*big.Rat); ok {
+						scale := d.fieldIDToFixedSize[fieldID]
+						scaleFactor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+						unscaled := new(big.Int).Mul(bigRatValue.Num(), scaleFactor)
+						unscaled = unscaled.Div(unscaled, bigRatValue.Denom())
+						decimal128Val := decimal128.FromBigInt(unscaled)
+
+						return DecimalLiteral{
+							Scale: scale,
+							Val:   decimal128Val,
+						}
+					}
+				}
+			}
+
+			return v
+		case avro.UUID:
+			if unionMap, ok := v.(map[string]any); ok {
+				if val, ok := unionMap["uuid"]; ok {
+					if uuidArr, ok := val.([16]byte); ok {
+						return uuid.UUID(uuidArr)
+					}
+				}
+			}
+
+			return v
+		}
+	}
+
+	return v
 }
 
 func (d *dataFileImm) setFieldNameToIDMap(m map[string]int) { d.fieldNameToID = m }
 func (d *dataFileImm) setFieldIDToLogicalTypeMap(m map[int]avro.LogicalType) {
 	d.fieldIDToLogicalType = m
 }
+func (d *dataFileImm) setFieldIDToFixedSizeMap(m map[int]int) { d.fieldIDToFixedSize = m }
 
 func (d *dataFileImm) ContentType() ManifestEntryContent { return d.Content }
 func (d *dataFileImm) FilePath() string                  { return d.Path }
@@ -1587,7 +1863,7 @@ func (d *dataFileImm) Partition() map[int]any {
 
 func (d *dataFileImm) Count() int64         { return d.RecordCount }
 func (d *dataFileImm) FileSizeBytes() int64 { return d.FileSize }
-func (d extendedDataFile) SpecID() int32        { return d.specID }
+func (d extendedDataFile) SpecID() int32    { return d.specID }
 func (d extendedDataFile) WithSpecID(id int32) DataFile {
 	return &extendedDataFile{
 		dataFileImm: d.dataFileImm,
@@ -1662,6 +1938,11 @@ func (d *dataFileImm) EqualityFieldIDs() []int {
 }
 
 func (d *dataFileImm) SortOrderID() *int { return d.SortOrder }
+
+func (d *dataFileImm) FirstRowID() *int64          { return d.FirstRowIDField }
+func (d *dataFileImm) ReferencedDataFile() *string { return d.ReferencedDataFileField }
+func (d *dataFileImm) ContentSizeInBytes() *int64  { return d.ContentSizeInBytesField }
+func (d *dataFileImm) ContentOffset() *int64       { return d.ContentOffsetField }
 
 type ManifestEntryBuilder struct {
 	m *manifestEntry
@@ -1800,6 +2081,8 @@ func NewDataFileBuilder(
 	path string,
 	format FileFormat,
 	fieldIDToPartitionData map[int]any,
+	fieldIDToLogicalType map[int]avro.LogicalType,
+	fieldIDToFixedSize map[int]int,
 	recordCount int64,
 	fileSize int64,
 ) (*DataFileBuilder, error) {
@@ -1848,6 +2131,8 @@ func NewDataFileBuilder(
 				FileSize:               fileSize,
 				fieldIDToPartitionData: fieldIDToPartitionData,
 				fieldNameToID:          fieldNameToID,
+				fieldIDToLogicalType:   fieldIDToLogicalType,
+				fieldIDToFixedSize:     fieldIDToFixedSize,
 			},
 			specID: int32(spec.id),
 		},
@@ -1938,8 +2223,32 @@ func (b *DataFileBuilder) SortOrderID(id int) *DataFileBuilder {
 	return b
 }
 
+func (b *DataFileBuilder) FirstRowID(id int64) *DataFileBuilder {
+	b.d.FirstRowIDField = &id
+
+	return b
+}
+
+func (b *DataFileBuilder) ReferencedDataFile(path string) *DataFileBuilder {
+	b.d.ReferencedDataFileField = &path
+
+	return b
+}
+
+func (b *DataFileBuilder) ContentOffset(offset int64) *DataFileBuilder {
+	b.d.ContentOffsetField = &offset
+
+	return b
+}
+
+func (b *DataFileBuilder) ContentSizeInBytes(size int64) *DataFileBuilder {
+	b.d.ContentSizeInBytesField = &size
+
+	return b
+}
+
 func (b *DataFileBuilder) Build() DataFile {
-	return b.d
+	return &b.d
 }
 
 // DataFile is the interface for reading the information about a
@@ -1956,8 +2265,7 @@ type DataFile interface {
 	// Partition returns a mapping of field id to partition value for
 	// each of the partition spec's fields.
 	Partition() map[int]any
-	// PartitionFieldData returns a mapping of field id to partition value
-	// for each of the partition spec's fields.
+	// Count returns the number of records in this file.
 	Count() int64
 	// FileSizeBytes is the total file size in bytes.
 	FileSizeBytes() int64
@@ -2005,8 +2313,15 @@ type DataFile interface {
 	// SpecID returns the partition spec id for this data file, inherited
 	// from the manifest that the data file was read from
 	SpecID() int32
-
 	WithSpecID(id int32) DataFile
+	// FirstRowID returns the first row ID for this data file ( v3+ only )
+	FirstRowID() *int64
+	// ReferencedDataFile returns the location of the data file that deletion vector reference
+	ReferencedDataFile() *string
+	// ContentOffset returns the offset in the file where the content starts ( v3+ only )
+	ContentOffset() *int64
+	// ContentSizeInBytes returns the length of referenced contented stored in the file (v3+ only)
+	ContentSizeInBytes() *int64
 }
 
 // ManifestEntry is an interface for both v1 and v2 manifest entries.

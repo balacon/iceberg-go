@@ -19,12 +19,14 @@ package iceberg_test
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/decimal"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/iceberg-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -209,6 +211,7 @@ func TestManifestPartitionVals(t *testing.T) {
 				partitionSpec, iceberg.EntryContentData,
 				"1234.parquet", iceberg.ParquetFile,
 				map[int]any{1000: result.Val.Any()},
+				nil, nil,
 				100, 100_000,
 			)
 			require.NoError(t, err)
@@ -263,6 +266,7 @@ func TestCanTransform(t *testing.T) {
 				iceberg.PrimitiveTypes.Bool, iceberg.PrimitiveTypes.Int32, iceberg.PrimitiveTypes.Int64,
 				iceberg.PrimitiveTypes.Float32, iceberg.PrimitiveTypes.Float64, iceberg.PrimitiveTypes.Date,
 				iceberg.PrimitiveTypes.Time, iceberg.PrimitiveTypes.Timestamp, iceberg.PrimitiveTypes.TimestampTz,
+				iceberg.PrimitiveTypes.TimestampNs, iceberg.PrimitiveTypes.TimestampTzNs,
 				iceberg.PrimitiveTypes.String, iceberg.PrimitiveTypes.Binary, iceberg.PrimitiveTypes.UUID,
 				iceberg.DecimalTypeOf(2, 1), iceberg.FixedTypeOf(2), &iceberg.StructType{}, &iceberg.ListType{}, &iceberg.MapType{},
 			},
@@ -273,6 +277,7 @@ func TestCanTransform(t *testing.T) {
 			allowed: []iceberg.Type{
 				iceberg.PrimitiveTypes.Int32, iceberg.PrimitiveTypes.Int64, iceberg.PrimitiveTypes.Date,
 				iceberg.PrimitiveTypes.Time, iceberg.PrimitiveTypes.Timestamp, iceberg.PrimitiveTypes.TimestampTz,
+				iceberg.PrimitiveTypes.TimestampNs, iceberg.PrimitiveTypes.TimestampTzNs,
 				iceberg.DecimalTypeOf(2, 1), iceberg.PrimitiveTypes.String, iceberg.FixedTypeOf(2), iceberg.PrimitiveTypes.Binary,
 				iceberg.PrimitiveTypes.UUID,
 			},
@@ -291,6 +296,7 @@ func TestCanTransform(t *testing.T) {
 				iceberg.PrimitiveTypes.Bool, iceberg.PrimitiveTypes.Float32, iceberg.PrimitiveTypes.Float64,
 				iceberg.PrimitiveTypes.Date, iceberg.PrimitiveTypes.Time, iceberg.PrimitiveTypes.Timestamp,
 				iceberg.PrimitiveTypes.TimestampTz, iceberg.PrimitiveTypes.UUID, iceberg.FixedTypeOf(2),
+				iceberg.PrimitiveTypes.TimestampNs, iceberg.PrimitiveTypes.TimestampTzNs,
 				&iceberg.StructType{}, &iceberg.ListType{}, &iceberg.MapType{},
 			},
 		},
@@ -298,6 +304,7 @@ func TestCanTransform(t *testing.T) {
 			transform: iceberg.YearTransform{},
 			allowed: []iceberg.Type{
 				iceberg.PrimitiveTypes.Date, iceberg.PrimitiveTypes.Timestamp, iceberg.PrimitiveTypes.TimestampTz,
+				iceberg.PrimitiveTypes.TimestampNs, iceberg.PrimitiveTypes.TimestampTzNs,
 			},
 			notAllowed: []iceberg.Type{
 				iceberg.PrimitiveTypes.Bool, iceberg.PrimitiveTypes.Int32, iceberg.PrimitiveTypes.Int64,
@@ -310,6 +317,7 @@ func TestCanTransform(t *testing.T) {
 			transform: iceberg.MonthTransform{},
 			allowed: []iceberg.Type{
 				iceberg.PrimitiveTypes.Date, iceberg.PrimitiveTypes.Timestamp, iceberg.PrimitiveTypes.TimestampTz,
+				iceberg.PrimitiveTypes.TimestampNs, iceberg.PrimitiveTypes.TimestampTzNs,
 			},
 			notAllowed: []iceberg.Type{
 				iceberg.PrimitiveTypes.Bool, iceberg.PrimitiveTypes.Int32, iceberg.PrimitiveTypes.Int64,
@@ -321,6 +329,7 @@ func TestCanTransform(t *testing.T) {
 		{
 			transform: iceberg.DayTransform{},
 			allowed: []iceberg.Type{
+				iceberg.PrimitiveTypes.TimestampNs, iceberg.PrimitiveTypes.TimestampTzNs,
 				iceberg.PrimitiveTypes.Date, iceberg.PrimitiveTypes.Timestamp, iceberg.PrimitiveTypes.TimestampTz,
 			},
 			notAllowed: []iceberg.Type{
@@ -333,6 +342,7 @@ func TestCanTransform(t *testing.T) {
 		{
 			transform: iceberg.HourTransform{},
 			allowed: []iceberg.Type{
+				iceberg.PrimitiveTypes.TimestampNs, iceberg.PrimitiveTypes.TimestampTzNs,
 				iceberg.PrimitiveTypes.Timestamp, iceberg.PrimitiveTypes.TimestampTz,
 			},
 			notAllowed: []iceberg.Type{
@@ -352,5 +362,39 @@ func TestCanTransform(t *testing.T) {
 		for _, typ := range tt.notAllowed {
 			assert.False(t, tt.transform.CanTransform(typ), "%s: expected CanTransform(%T) to be false", tt.transform.String(), typ)
 		}
+	}
+}
+
+func TestTruncateTransform(t *testing.T) {
+	tests := []struct {
+		width    int
+		value    iceberg.Literal
+		expected iceberg.Literal
+	}{
+		{10, iceberg.Int32Literal(1), iceberg.Int32Literal(0)},
+		{10, iceberg.Int32Literal(-1), iceberg.Int32Literal(-10)},
+		{10, iceberg.Int64Literal(1), iceberg.Int64Literal(0)},
+		{10, iceberg.Int64Literal(-1), iceberg.Int64Literal(-10)},
+		{50, iceberg.DecimalLiteral{
+			Val:   decimal128.FromI64(1065),
+			Scale: 2,
+		}, iceberg.DecimalLiteral{
+			Val:   decimal128.FromI64(1050),
+			Scale: 2,
+		}},
+		{3, iceberg.StringLiteral("abcdef"), iceberg.StringLiteral("abc")},
+		{
+			3, iceberg.BinaryLiteral([]byte{0x01, 0x02, 0x03, 0x04, 0x05}),
+			iceberg.BinaryLiteral([]byte{0x01, 0x02, 0x03}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("width=%d value=%v", tt.width, tt.value.Any()), func(t *testing.T) {
+			transform := iceberg.TruncateTransform{Width: tt.width}
+			result := transform.Apply(iceberg.Optional[iceberg.Literal]{Val: tt.value, Valid: true})
+			require.True(t, result.Valid)
+			assert.Equal(t, tt.expected, result.Val)
+		})
 	}
 }

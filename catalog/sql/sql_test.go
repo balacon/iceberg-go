@@ -278,12 +278,12 @@ func (s *SqliteCatalogTestSuite) TestCreationOneTableExists() {
 	s.confirmNoTables(sqldb)
 
 	_, err := sqldb.Exec(`CREATE TABLE "iceberg_tables" (
-		"catalog_name" VARCHAR NOT NULL, 
-		"table_namespace" VARCHAR NOT NULL, 
+		"catalog_name" VARCHAR NOT NULL,
+		"table_namespace" VARCHAR NOT NULL,
 		"table_name" VARCHAR NOT NULL,
 		"iceberg_type" VARCHAR NOT NULL DEFAULT 'TABLE',
-		"metadata_location" VARCHAR, 
-		"previous_metadata_location" VARCHAR, 
+		"metadata_location" VARCHAR,
+		"previous_metadata_location" VARCHAR,
 		PRIMARY KEY ("catalog_name", "table_namespace", "table_name"))`)
 	s.Require().NoError(err)
 
@@ -297,20 +297,20 @@ func (s *SqliteCatalogTestSuite) TestCreationAllTablesExist() {
 	s.confirmNoTables(sqldb)
 
 	_, err := sqldb.Exec(`CREATE TABLE "iceberg_tables" (
-		"catalog_name" VARCHAR NOT NULL, 
-		"table_namespace" VARCHAR NOT NULL, 
+		"catalog_name" VARCHAR NOT NULL,
+		"table_namespace" VARCHAR NOT NULL,
 		"table_name" VARCHAR NOT NULL,
 		"iceberg_type" VARCHAR,
-		"metadata_location" VARCHAR, 
-		"previous_metadata_location" VARCHAR, 
+		"metadata_location" VARCHAR,
+		"previous_metadata_location" VARCHAR,
 		PRIMARY KEY ("catalog_name", "table_namespace", "table_name"))`)
 	s.Require().NoError(err)
 
 	_, err = sqldb.Exec(`CREATE TABLE "iceberg_namespace_properties" (
-		"catalog_name" VARCHAR NOT NULL, 
-		"namespace" VARCHAR NOT NULL, 
-		"property_key" VARCHAR NOT NULL, 
-		"property_value" VARCHAR, 
+		"catalog_name" VARCHAR NOT NULL,
+		"namespace" VARCHAR NOT NULL,
+		"property_key" VARCHAR NOT NULL,
+		"property_value" VARCHAR,
 		PRIMARY KEY ("catalog_name", "namespace", "property_key"))`)
 	s.Require().NoError(err)
 
@@ -368,7 +368,7 @@ func (s *SqliteCatalogTestSuite) TestCreateTableDefaultSortOrder() {
 
 		s.FileExists(strings.TrimPrefix(tbl.MetadataLocation(), "file://"))
 
-		s.Equal(0, tbl.SortOrder().OrderID)
+		s.Equal(0, tbl.SortOrder().OrderID())
 		s.NoError(tt.cat.DropTable(context.Background(), tt.tblID))
 	}
 }
@@ -386,11 +386,11 @@ func (s *SqliteCatalogTestSuite) TestCreateV1Table() {
 		ns := catalog.NamespaceFromIdent(tt.tblID)
 		s.Require().NoError(tt.cat.CreateNamespace(context.Background(), ns, nil))
 		tbl, err := tt.cat.CreateTable(context.Background(), tt.tblID, tableSchemaNested,
-			catalog.WithProperties(iceberg.Properties{"format-version": "1"}))
+			catalog.WithProperties(iceberg.Properties{table.PropertyFormatVersion: "1"}))
 		s.Require().NoError(err)
 
 		s.FileExists(strings.TrimPrefix(tbl.MetadataLocation(), "file://"))
-		s.Equal(0, tbl.SortOrder().OrderID)
+		s.Equal(0, tbl.SortOrder().OrderID())
 		s.Equal(1, tbl.Metadata().Version())
 		s.True(tbl.Spec().Equals(*iceberg.UnpartitionedSpec))
 		s.NoError(tt.cat.DropTable(context.Background(), tt.tblID))
@@ -410,20 +410,26 @@ func (s *SqliteCatalogTestSuite) TestCreateTableCustomSortOrder() {
 		ns := catalog.NamespaceFromIdent(tt.tblID)
 		s.Require().NoError(tt.cat.CreateNamespace(context.Background(), ns, nil))
 
-		order := table.SortOrder{Fields: []table.SortField{
-			{SourceID: 2, Transform: iceberg.IdentityTransform{}, NullOrder: table.NullsFirst},
-		}}
-
+		order, err := table.NewSortOrder(1, []table.SortField{
+			{SourceID: 2, Transform: iceberg.IdentityTransform{}, NullOrder: table.NullsFirst, Direction: table.SortASC},
+		})
+		s.Require().NoError(err)
 		tbl, err := tt.cat.CreateTable(context.Background(), tt.tblID, tableSchemaNested,
 			catalog.WithSortOrder(order))
 		s.Require().NoError(err)
 
 		s.FileExists(strings.TrimPrefix(tbl.MetadataLocation(), "file://"))
-		s.Equal(1, tbl.SortOrder().OrderID)
-		s.Len(tbl.SortOrder().Fields, 1)
-		s.Equal(table.SortASC, tbl.SortOrder().Fields[0].Direction)
-		s.Equal(table.NullsFirst, tbl.SortOrder().Fields[0].NullOrder)
-		s.Equal("identity", tbl.SortOrder().Fields[0].Transform.String())
+		s.Equal(1, tbl.SortOrder().OrderID())
+		s.Equal(tbl.SortOrder().Len(), 1)
+
+		for f := range tbl.SortOrder().Fields() {
+			s.Equal(table.SortASC, f.Direction)
+			s.Equal(table.NullsFirst, f.NullOrder)
+			s.Equal("identity", f.Transform.String())
+
+			break
+		}
+
 		s.NoError(tt.cat.DropTable(context.Background(), tt.tblID))
 	}
 }
@@ -441,7 +447,7 @@ func (s *SqliteCatalogTestSuite) TestCreateDuplicatedTable() {
 		ns := catalog.NamespaceFromIdent(tt.tblID)
 		s.Require().NoError(tt.cat.CreateNamespace(context.Background(), ns, nil))
 		_, err := tt.cat.CreateTable(context.Background(), tt.tblID, tableSchemaNested,
-			catalog.WithProperties(iceberg.Properties{"format-version": "1"}))
+			catalog.WithProperties(iceberg.Properties{table.PropertyFormatVersion: "1"}))
 		s.Require().NoError(err)
 
 		_, err = tt.cat.CreateTable(context.Background(), tt.tblID, tableSchemaNested)
@@ -609,11 +615,11 @@ func (s *SqliteCatalogTestSuite) TestLoadTableFromSelfIdentifier() {
 		table, err := tt.cat.CreateTable(context.Background(), tt.tblID, tableSchemaNested)
 		s.Require().NoError(err)
 
-		intermediate, err := tt.cat.LoadTable(context.Background(), tt.tblID, nil)
+		intermediate, err := tt.cat.LoadTable(context.Background(), tt.tblID)
 		s.Require().NoError(err)
 		s.Equal(intermediate.Identifier(), table.Identifier())
 
-		loaded, err := tt.cat.LoadTable(context.Background(), intermediate.Identifier(), nil)
+		loaded, err := tt.cat.LoadTable(context.Background(), intermediate.Identifier())
 		s.Require().NoError(err)
 
 		s.Equal(table.Identifier(), loaded.Identifier())
@@ -639,10 +645,10 @@ func (s *SqliteCatalogTestSuite) TestDropTable() {
 
 		s.Equal(tt.tblID, table.Identifier())
 		s.NoError(tt.cat.DropTable(context.Background(), tt.tblID))
-		_, err = tt.cat.LoadTable(context.Background(), tt.tblID, nil)
+		_, err = tt.cat.LoadTable(context.Background(), tt.tblID)
 		s.ErrorIs(err, catalog.ErrNoSuchTable)
 
-		_, err = tt.cat.LoadTable(context.Background(), table.Identifier(), nil)
+		_, err = tt.cat.LoadTable(context.Background(), table.Identifier())
 		s.ErrorIs(err, catalog.ErrNoSuchTable)
 	}
 }
@@ -651,7 +657,7 @@ func (s *SqliteCatalogTestSuite) TestLoadTableNotExists() {
 	catalogs := []*sqlcat.Catalog{s.getCatalogMemory(), s.getCatalogSqlite()}
 
 	for _, cat := range catalogs {
-		_, err := cat.LoadTable(context.Background(), s.randomTableIdentifier(), nil)
+		_, err := cat.LoadTable(context.Background(), s.randomTableIdentifier())
 		s.ErrorIs(err, catalog.ErrNoSuchTable)
 	}
 }
@@ -664,7 +670,7 @@ func (s *SqliteCatalogTestSuite) TestLoadTableInvalidMetadata() {
 			VALUES ('default', 'default', 'invalid_metadata')`)
 	s.Require().NoError(err)
 
-	_, err = cat.LoadTable(context.Background(), table.Identifier{"default", "invalid_metadata"}, nil)
+	_, err = cat.LoadTable(context.Background(), table.Identifier{"default", "invalid_metadata"})
 	s.ErrorIs(err, catalog.ErrNoSuchTable)
 }
 
@@ -704,7 +710,7 @@ func (s *SqliteCatalogTestSuite) TestRenameTable() {
 		s.Equal(tt.toTable, renamed.Identifier())
 		s.Equal(table.MetadataLocation(), renamed.MetadataLocation())
 
-		_, err = tt.cat.LoadTable(ctx, tt.fromTable, nil)
+		_, err = tt.cat.LoadTable(ctx, tt.fromTable)
 		s.ErrorIs(err, catalog.ErrNoSuchTable)
 	}
 }
@@ -1091,6 +1097,38 @@ func (s *SqliteCatalogTestSuite) TestDropView() {
 	s.ErrorIs(err, catalog.ErrNoSuchView)
 }
 
+func (s *SqliteCatalogTestSuite) TestDropViewWithInvalidMetadataLocation() {
+	db := s.getCatalogSqlite()
+	s.Require().NoError(db.CreateSQLTables(context.Background()))
+
+	nsName := databaseName()
+	viewName := tableName()
+	s.Require().NoError(db.CreateNamespace(context.Background(), []string{nsName}, nil))
+
+	viewSQL := "SELECT * FROM test_table"
+	schema := iceberg.NewSchema(1, iceberg.NestedField{
+		ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true,
+	})
+	s.Require().NoError(db.CreateView(context.Background(), []string{nsName, viewName}, schema, viewSQL, nil))
+
+	// Manually update the metadata location to a URL with an unsupported scheme
+	// This will cause io.LoadFS to fail with "IO for file '...' not implemented"
+	sqldb := s.getDB()
+	defer sqldb.Close()
+
+	_, err := sqldb.Exec(
+		"UPDATE iceberg_tables SET metadata_location = ? WHERE table_namespace = ? AND table_name = ?",
+		"unsupported-scheme://bucket/metadata.json",
+		nsName,
+		viewName,
+	)
+	s.Require().NoError(err)
+
+	// DropView should return an error when io.LoadFS fails
+	err = db.DropView(context.Background(), []string{nsName, viewName})
+	s.Error(err, "DropView should return an error when LoadFS fails for invalid metadata location")
+}
+
 func (s *SqliteCatalogTestSuite) TestCheckViewExists() {
 	db := s.getCatalogSqlite()
 	s.Require().NoError(db.CreateSQLTables(context.Background()))
@@ -1173,8 +1211,9 @@ func (s *SqliteCatalogTestSuite) TestLoadView() {
 	viewInfo, err := db.LoadView(context.Background(), []string{nsName, viewName})
 	s.Require().NoError(err)
 
-	s.Equal(viewName, viewInfo["name"])
-	s.Equal(nsName, viewInfo["namespace"])
+	s.Equal(1, viewInfo.FormatVersion())
+	s.Contains(viewInfo.Properties(), "comment")
+	s.Equal("Test view", viewInfo.Properties()["comment"])
 
 	_, err = db.LoadView(context.Background(), []string{nsName, "nonexistent"})
 	s.Error(err)

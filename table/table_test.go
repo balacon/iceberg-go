@@ -19,8 +19,11 @@ package table_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -34,6 +37,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/iceberg-go"
@@ -114,6 +118,40 @@ func (t *TableTestSuite) TestNewTableFromReadFile() {
 	t.True(t.tbl.Equals(*tbl2))
 }
 
+func (t *TableTestSuite) TestNewTableFromReadFileGzipped() {
+	var b bytes.Buffer
+	gzWriter := gzip.NewWriter(&b)
+
+	_, err := gzWriter.Write([]byte(table.ExampleTableMetadataV2))
+	if err != nil {
+		log.Fatalf("Error writing to gzip writer: %v", err)
+	}
+	err = gzWriter.Close()
+	if err != nil {
+		log.Fatalf("Error closing gzip writer: %v", err)
+	}
+
+	var mockfsReadFile internal.MockFSReadFile
+	mockfsReadFile.Test(t.T())
+	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.gz.metadata.json").
+		Return(b.Bytes(), nil)
+	defer mockfsReadFile.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.gz.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfsReadFile, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
 func (t *TableTestSuite) TestSchema() {
 	t.True(t.tbl.Schema().Equals(iceberg.NewSchemaWithIdentifiers(1, []int{1, 2},
 		iceberg.NestedField{ID: 1, Name: "x", Type: iceberg.PrimitiveTypes.Int64, Required: true},
@@ -129,13 +167,15 @@ func (t *TableTestSuite) TestPartitionSpec() {
 }
 
 func (t *TableTestSuite) TestSortOrder() {
-	t.Equal(table.SortOrder{
-		OrderID: 3,
-		Fields: []table.SortField{
+	expected, err := table.NewSortOrder(
+		3,
+		[]table.SortField{
 			{SourceID: 2, Transform: iceberg.IdentityTransform{}, Direction: table.SortASC, NullOrder: table.NullsFirst},
 			{SourceID: 3, Transform: iceberg.BucketTransform{NumBuckets: 4}, Direction: table.SortDESC, NullOrder: table.NullsLast},
 		},
-	}, t.tbl.SortOrder())
+	)
+	require.NoError(t.T(), err)
+	t.Equal(expected, t.tbl.SortOrder())
 }
 
 func (t *TableTestSuite) TestLocation() {
@@ -294,7 +334,7 @@ func (t *TableWritingTestSuite) SetupSuite() {
 }
 
 func (t *TableWritingTestSuite) SetupTest() {
-	t.location = filepath.ToSlash(strings.Replace(t.T().TempDir(), "#", "", -1))
+	t.location = filepath.ToSlash(strings.ReplaceAll(t.T().TempDir(), "#", ""))
 }
 
 func (t *TableWritingTestSuite) TearDownSuite() {
@@ -318,7 +358,7 @@ func (t *TableWritingTestSuite) writeParquet(fio iceio.WriteFileIO, filePath str
 
 func (t *TableWritingTestSuite) createTable(identifier table.Identifier, formatVersion int, spec iceberg.PartitionSpec, sc *iceberg.Schema) *table.Table {
 	meta, err := table.NewMetadata(sc, &spec, table.UnsortedSortOrder,
-		t.location, iceberg.Properties{"format-version": strconv.Itoa(formatVersion)})
+		t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(formatVersion)})
 	t.Require().NoError(err)
 
 	return table.New(
@@ -778,28 +818,21 @@ func (t *TableWritingTestSuite) TestAddFilesReferencedCurrentSnapshotIgnoreDupli
 	t.Equal([]int32{0, 0, 0}, deleted)
 }
 
-type mockedCatalog struct{}
+type mockedCatalog struct {
+	metadata table.Metadata
+}
 
-func (m *mockedCatalog) LoadTable(ctx context.Context, ident table.Identifier, props iceberg.Properties) (*table.Table, error) {
+func (m *mockedCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
 	return nil, nil
 }
 
-func (m *mockedCatalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
-	bldr, err := table.MetadataBuilderFromBase(tbl.Metadata())
+func (m *mockedCatalog) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	meta, err := table.UpdateTableMetadata(m.metadata, updates, "")
 	if err != nil {
 		return nil, "", err
 	}
 
-	for _, u := range updates {
-		if err := u.Apply(bldr); err != nil {
-			return nil, "", err
-		}
-	}
-
-	meta, err := bldr.Build()
-	if err != nil {
-		return nil, "", err
-	}
+	m.metadata = meta
 
 	return meta, "", nil
 }
@@ -816,7 +849,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 
 	ident := table.Identifier{"default", "replace_data_files_v" + strconv.Itoa(t.formatVersion)}
 	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
-		table.UnsortedSortOrder, t.location, iceberg.Properties{"format-version": strconv.Itoa(t.formatVersion)})
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
 	t.Require().NoError(err)
 
 	ctx := context.Background()
@@ -828,7 +861,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 		func(ctx context.Context) (iceio.IO, error) {
 			return fs, nil
 		},
-		&mockedCatalog{},
+		&mockedCatalog{meta},
 	)
 	for i := range 5 {
 		tx := tbl.NewTransaction()
@@ -898,7 +931,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshots() {
 
 	ident := table.Identifier{"default", "replace_data_files_v" + strconv.Itoa(t.formatVersion)}
 	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
-		table.UnsortedSortOrder, t.location, iceberg.Properties{"format-version": strconv.Itoa(t.formatVersion)})
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
 	t.Require().NoError(err)
 
 	ctx := context.Background()
@@ -910,7 +943,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshots() {
 		func(ctx context.Context) (iceio.IO, error) {
 			return fs, nil
 		},
-		&mockedCatalog{},
+		&mockedCatalog{meta},
 	)
 
 	tblfs, err := tbl.FS(ctx)
@@ -935,6 +968,342 @@ func (t *TableWritingTestSuite) TestExpireSnapshots() {
 	t.Require().NoError(err)
 	t.Require().Equal(2, len(tbl.Metadata().Snapshots()))
 	t.Require().Equal(2, len(slices.Collect(tbl.Metadata().SnapshotLogs())))
+}
+
+// TestExpireSnapshotsNoOpWhenNothingToExpire verifies that when there are no
+// snapshots to expire, no new metadata file is created. This prevents unnecessary
+// metadata file proliferation when the maintenance job runs but finds nothing to do.
+func (t *TableWritingTestSuite) TestExpireSnapshotsNoOpWhenNothingToExpire() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 3 {
+		filePath := fmt.Sprintf("%s/expire_noop_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_noop_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		&mockedCatalog{meta},
+	)
+
+	// Create 3 snapshots
+	for i := range 3 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	t.Require().Equal(3, len(tbl.Metadata().Snapshots()))
+
+	// Record the metadata location before ExpireSnapshots
+	metadataLocationBefore := tbl.MetadataLocation()
+
+	// Call ExpireSnapshots with parameters that won't expire anything:
+	// - RetainLast(10) keeps more snapshots than we have
+	// - OlderThan(time.Hour) won't expire recent snapshots
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots(table.WithOlderThan(time.Hour), table.WithRetainLast(10)))
+	tbl, err = tx.Commit(ctx)
+	t.Require().NoError(err)
+
+	// Verify no snapshots were removed
+	t.Require().Equal(3, len(tbl.Metadata().Snapshots()))
+
+	// Verify no new metadata file was created (metadata location unchanged)
+	t.Require().Equal(metadataLocationBefore, tbl.MetadataLocation(),
+		"metadata location should not change when there are no snapshots to expire")
+}
+
+func (t *TableWritingTestSuite) TestExpireSnapshotsWithMissingParent() {
+	// This test validates the fix for handling missing parent snapshots.
+	// After expiring snapshots, remaining snapshots may have parent-snapshot-id
+	// references pointing to snapshots that no longer exist. ExpireSnapshots should
+	// treat missing parents as the end of the chain rather than returning an error.
+
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/expire_with_missing_parent_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_with_missing_parent_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		&mockedCatalog{meta},
+	)
+
+	// Create 5 snapshots, each one with a parent pointing to the previous
+	for i := range 5 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	t.Require().Equal(5, len(tbl.Metadata().Snapshots()))
+
+	// Get the snapshot IDs before expiration
+	snapshotsBeforeExpire := tbl.Metadata().Snapshots()
+	snapshot3ID := snapshotsBeforeExpire[2].SnapshotID
+	snapshot4ID := snapshotsBeforeExpire[3].SnapshotID
+
+	// Expire the first 3 snapshots, keeping only the last 2
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots(table.WithOlderThan(0), table.WithRetainLast(2)))
+	tbl, err = tx.Commit(ctx)
+	t.Require().NoError(err)
+	t.Require().Equal(2, len(tbl.Metadata().Snapshots()))
+
+	// Verify that the 4th snapshot's parent (snapshot 3) is no longer in the metadata
+	remainingSnapshots := tbl.Metadata().Snapshots()
+	var snapshot4 *table.Snapshot
+	for i := range remainingSnapshots {
+		if remainingSnapshots[i].SnapshotID == snapshot4ID {
+			snapshot4 = &remainingSnapshots[i]
+
+			break
+		}
+	}
+	t.Require().NotNil(snapshot4, "snapshot 4 should still exist")
+	t.Require().NotNil(snapshot4.ParentSnapshotID, "snapshot 4 should have a parent ID")
+	t.Require().Equal(snapshot3ID, *snapshot4.ParentSnapshotID, "snapshot 4's parent should be snapshot 3")
+
+	// Verify snapshot 3 is no longer in the metadata
+	t.Nil(tbl.Metadata().SnapshotByID(snapshot3ID), "snapshot 3 should have been removed")
+
+	// At this point, the 4th snapshot has a parent-snapshot-id pointing to
+	// the 3rd snapshot which no longer exists. Try to expire again - this
+	// should not fail even though the parent is missing. Use WithRetainLast(2)
+	// to force walking the full parent chain.
+	tx = tbl.NewTransaction()
+	// This should succeed without error despite the missing parent.
+	// WithRetainLast(2) will cause it to walk back through snapshot 4's parent chain,
+	// encountering the missing snapshot 3.
+	err = tx.ExpireSnapshots(table.WithOlderThan(0), table.WithRetainLast(2))
+	t.Require().NoError(err, "ExpireSnapshots should handle missing parent gracefully")
+
+	tbl, err = tx.Commit(ctx)
+	t.Require().NoError(err)
+	t.Require().Equal(2, len(tbl.Metadata().Snapshots()), "should still have 2 snapshots")
+}
+
+// validatingCatalog validates requirements before applying updates,
+// simulating real catalog behavior for concurrent modification tests.
+type validatingCatalog struct {
+	metadata table.Metadata
+}
+
+func (m *validatingCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	return nil, nil
+}
+
+func (m *validatingCatalog) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	// Validate requirements against current metadata (simulates catalog behavior)
+	for _, req := range reqs {
+		if err := req.Validate(m.metadata); err != nil {
+			return nil, "", err
+		}
+	}
+
+	meta, err := table.UpdateTableMetadata(m.metadata, updates, "")
+	if err != nil {
+		return nil, "", err
+	}
+
+	m.metadata = meta
+
+	return meta, "", nil
+}
+
+// TestExpireSnapshotsRejectsOnRefRollback verifies that ExpireSnapshots fails
+// when a ref is rolled back to an ancestor snapshot concurrently.
+//
+// Scenario:
+//   - main -> snapshot 5 (newest), chain: 5 <- 4 <- 3 <- 2 <- 1
+//   - ExpireSnapshots calculates: keep {5, 4, 3}, delete {2, 1}
+//   - Concurrently, client rolls main -> snapshot 2
+//   - Without assertion: would delete snapshots 1, leaving main with only 1 accessible snapshot
+//   - With assertion: commit fails because main's snapshot ID changed
+func (t *TableWritingTestSuite) TestExpireSnapshotsRejectsOnRefRollback() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/expire_reject_rollback_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_reject_rollback_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+	cat := &validatingCatalog{meta}
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		cat,
+	)
+
+	// Create 5 snapshots
+	for i := range 5 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	t.Require().Equal(5, len(tbl.Metadata().Snapshots()))
+
+	// Get snapshot IDs for later use
+	snapshots := tbl.Metadata().Snapshots()
+	snapshot2 := snapshots[1] // Second snapshot (index 1)
+
+	// Start ExpireSnapshots transaction (will calculate based on current main -> snapshot 5)
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots(table.WithOlderThan(0), table.WithRetainLast(3)))
+
+	// Simulate concurrent rollback: update catalog's metadata to point main -> snapshot 2
+	// This simulates another client rolling back main before ExpireSnapshots commits
+	rollbackUpdates := []table.Update{
+		table.NewSetSnapshotRefUpdate("main", snapshot2.SnapshotID, table.BranchRef, -1, -1, -1),
+	}
+	cat.metadata, _, err = cat.CommitTable(ctx, ident, nil, rollbackUpdates)
+	t.Require().NoError(err)
+
+	// Attempt to commit ExpireSnapshots - should fail due to AssertRefSnapshotID
+	_, err = tx.Commit(ctx)
+	t.Require().Error(err)
+	t.Require().Contains(err.Error(), "requirement failed")
+	t.Require().Contains(err.Error(), "main")
+}
+
+// TestExpireSnapshotsRejectsOnRefUpdate verifies that ExpireSnapshots fails
+// when a ref eligible for deletion is concurrently updated to a newer snapshot.
+//
+// Scenario:
+//   - tag1 -> old snapshot, eligible for deletion (maxRefAgeMs exceeded)
+//   - ExpireSnapshots decides to remove tag1
+//   - Concurrently, client updates tag1 -> newer snapshot (no longer eligible)
+//   - Without assertion: tag1 would be deleted despite being updated
+//   - With assertion: commit fails because tag1's snapshot ID changed
+func (t *TableWritingTestSuite) TestExpireSnapshotsRejectsOnRefUpdate() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 3 {
+		filePath := fmt.Sprintf("%s/expire_reject_update_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_reject_update_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+	cat := &validatingCatalog{meta}
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		cat,
+	)
+
+	// Create 3 snapshots
+	for i := range 3 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+	t.Require().Equal(3, len(tbl.Metadata().Snapshots()))
+
+	snapshots := tbl.Metadata().Snapshots()
+	oldSnapshot := snapshots[0]   // Oldest snapshot
+	newerSnapshot := snapshots[2] // Newest snapshot
+
+	// Create a tag pointing to the old snapshot with a short maxRefAgeMs
+	// This tag will be eligible for deletion
+	maxRefAgeMs := int64(1) // 1ms - will definitely be exceeded
+	tagUpdates := []table.Update{
+		table.NewSetSnapshotRefUpdate("expiring-tag", oldSnapshot.SnapshotID, table.TagRef, maxRefAgeMs, -1, -1),
+	}
+	cat.metadata, _, err = cat.CommitTable(ctx, ident, nil, tagUpdates)
+	t.Require().NoError(err)
+
+	// Reload table with updated metadata
+	tbl = table.New(
+		ident,
+		cat.metadata,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		cat,
+	)
+
+	// Wait a bit to ensure the tag's ref age exceeds maxRefAgeMs
+	time.Sleep(10 * time.Millisecond)
+
+	// Start ExpireSnapshots transaction (will identify expiring-tag as eligible for deletion)
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots(table.WithOlderThan(time.Hour), table.WithRetainLast(1)))
+
+	// Simulate concurrent update: another client updates the tag to point to a newer snapshot
+	// This makes the tag no longer eligible for deletion
+	updateTagUpdates := []table.Update{
+		table.NewSetSnapshotRefUpdate("expiring-tag", newerSnapshot.SnapshotID, table.TagRef, maxRefAgeMs, -1, -1),
+	}
+	cat.metadata, _, err = cat.CommitTable(ctx, ident, nil, updateTagUpdates)
+	t.Require().NoError(err)
+
+	// Attempt to commit ExpireSnapshots - should fail due to AssertRefSnapshotID
+	_, err = tx.Commit(ctx)
+	t.Require().Error(err)
+	t.Require().Contains(err.Error(), "requirement failed")
+	t.Require().Contains(err.Error(), "expiring-tag")
 }
 
 func (t *TableWritingTestSuite) TestWriteSpecialCharacterColumn() {
@@ -1148,7 +1517,7 @@ func (t *TableWritingTestSuite) TestMergeManifests() {
 			table.ParquetCompressionKey:    "snappy",
 			table.ManifestMergeEnabledKey:  "true",
 			table.ManifestMinMergeCountKey: "1",
-			"format-version":               strconv.Itoa(t.formatVersion),
+			table.PropertyFormatVersion:    strconv.Itoa(t.formatVersion),
 		}, tableSchema())
 
 	tblB := t.createTableWithProps(table.Identifier{"default", "merge_manifest_b"},
@@ -1157,14 +1526,14 @@ func (t *TableWritingTestSuite) TestMergeManifests() {
 			table.ManifestMergeEnabledKey:    "true",
 			table.ManifestMinMergeCountKey:   "1",
 			table.ManifestTargetSizeBytesKey: "1",
-			"format-version":                 strconv.Itoa(t.formatVersion),
+			table.PropertyFormatVersion:      strconv.Itoa(t.formatVersion),
 		}, tableSchema())
 
 	tblC := t.createTableWithProps(table.Identifier{"default", "merge_manifest_c"},
 		iceberg.Properties{
 			table.ParquetCompressionKey:    "snappy",
 			table.ManifestMinMergeCountKey: "1",
-			"format-version":               strconv.Itoa(t.formatVersion),
+			table.PropertyFormatVersion:    strconv.Itoa(t.formatVersion),
 		}, tableSchema())
 
 	arrTable := arrowTableWithNull()
@@ -1294,9 +1663,9 @@ func TestNullableStructRequiredField(t *testing.T) {
 	sc, err := table.ArrowSchemaToIcebergWithFreshIDs(arrowSchema, false)
 	require.NoError(t, err)
 
-	require.NoError(t, cat.CreateNamespace(t.Context(), table.Identifier{"testing"}, nil))
-	tbl, err := cat.CreateTable(t.Context(), table.Identifier{"testing", "nullable_struct_required_field"}, sc,
-		catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
+	require.NoError(t, cat.CreateNamespace(context.Background(), table.Identifier{"testing"}, nil))
+	tbl, err := cat.CreateTable(context.Background(), table.Identifier{"testing", "nullable_struct_required_field"}, sc,
+		catalog.WithProperties(iceberg.Properties{table.PropertyFormatVersion: "2"}),
 		catalog.WithLocation("file://"+loc))
 	require.NoError(t, err)
 	require.NotNil(t, tbl)
@@ -1308,10 +1677,10 @@ func TestNullableStructRequiredField(t *testing.T) {
 	bldr.Field(0).AppendNulls(N)
 	bldr.Field(1).AppendNulls(N)
 
-	rec := bldr.NewRecord()
+	rec := bldr.NewRecordBatch()
 	defer rec.Release()
 
-	arrTable := array.NewTableFromRecords(arrowSchema, []arrow.Record{rec})
+	arrTable := array.NewTableFromRecords(arrowSchema, []arrow.RecordBatch{rec})
 	defer arrTable.Release()
 
 	tx := tbl.NewTransaction()
@@ -1321,19 +1690,21 @@ func TestNullableStructRequiredField(t *testing.T) {
 	require.NotNil(t, stagedTbl)
 }
 
-type DeleteOldMetadataMockedCatalog struct{}
+type DeleteOldMetadataMockedCatalog struct {
+	metadata table.Metadata
+}
 
-func (m *DeleteOldMetadataMockedCatalog) LoadTable(ctx context.Context, ident table.Identifier, props iceberg.Properties) (*table.Table, error) {
+func (m *DeleteOldMetadataMockedCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
 	return nil, nil
 }
 
-func (m *DeleteOldMetadataMockedCatalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
-	bldr, err := table.MetadataBuilderFromBase(tbl.Metadata())
+func (m *DeleteOldMetadataMockedCatalog) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	bldr, err := table.MetadataBuilderFromBase(m.metadata, "")
 	if err != nil {
 		return nil, "", err
 	}
 
-	location := tbl.Metadata().Location()
+	location := m.metadata.Location()
 
 	randid := uuid.New().String()
 	metdatafile := fmt.Sprintf("%s/metadata/%s.metadata.json", location, randid)
@@ -1356,6 +1727,8 @@ func (m *DeleteOldMetadataMockedCatalog) CommitTable(ctx context.Context, tbl *t
 	if err != nil {
 		return nil, "", err
 	}
+
+	m.metadata = meta
 
 	return meta, metdatafile, nil
 }
@@ -1389,12 +1762,12 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataLogsErrorOnFileNotFound() {
 
 	ident := table.Identifier{"default", "file_v" + strconv.Itoa(t.formatVersion)}
 	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
-		table.UnsortedSortOrder, t.location, iceberg.Properties{"format-version": strconv.Itoa(t.formatVersion), "write.metadata.delete-after-commit.enabled": "true"})
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion), "write.metadata.delete-after-commit.enabled": "true"})
 	t.Require().NoError(err)
 
 	tbl := table.New(ident, meta, t.getMetadataLoc(), func(ctx context.Context) (iceio.IO, error) {
 		return fs, nil
-	}, &DeleteOldMetadataMockedCatalog{})
+	}, &DeleteOldMetadataMockedCatalog{meta})
 	ctx := context.Background()
 
 	// transaction 1 to create metadata file
@@ -1435,7 +1808,7 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
 	}
 
 	ident := table.Identifier{"default", "file_v" + strconv.Itoa(t.formatVersion)}
-	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, t.location, iceberg.Properties{"format-version": strconv.Itoa(t.formatVersion), "write.metadata.delete-after-commit.enabled": "true"})
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion), "write.metadata.delete-after-commit.enabled": "true"})
 	t.Require().NoError(err)
 
 	tbl := table.New(
@@ -1445,7 +1818,7 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
 		func(ctx context.Context) (iceio.IO, error) {
 			return fs, nil
 		},
-		&DeleteOldMetadataMockedCatalog{},
+		&DeleteOldMetadataMockedCatalog{meta},
 	)
 
 	ctx := context.Background()
@@ -1474,6 +1847,91 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
 	t.NotContains(logOutput, "no such file or directory")
 }
 
+// testing issue reported in https://github.com/apache/iceberg-go/issues/595
+func TestWriteMapType(t *testing.T) {
+	loc := filepath.ToSlash(t.TempDir())
+
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + loc,
+	})
+	require.NoError(t, err)
+
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+
+	ctx := compute.WithAllocator(context.Background(), mem)
+	cat.CreateNamespace(ctx, catalog.ToIdentifier("default"), nil)
+	iceSch := iceberg.NewSchema(1,
+		iceberg.NestedField{
+			ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.String, Required: true,
+		},
+		iceberg.NestedField{
+			ID: 2, Name: "attrs", Required: true, Type: &iceberg.MapType{
+				KeyID:         3,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       4,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			},
+		})
+
+	ident := catalog.ToIdentifier("default", "repro_map")
+	tbl, err := cat.CreateTable(ctx, ident, iceSch, catalog.WithLocation(loc))
+	require.NoError(t, err)
+
+	arrowSch, err := table.SchemaToArrowSchema(iceSch, nil, true, false)
+	require.NoError(t, err)
+
+	bldr := array.NewRecordBuilder(mem, arrowSch)
+	defer bldr.Release()
+
+	idbldr := bldr.Field(0).(*array.StringBuilder)
+	attrBldr := bldr.Field(1).(*array.MapBuilder)
+	attrKeyBldr := attrBldr.KeyBuilder().(*array.StringBuilder)
+	attrItemBldr := attrBldr.ItemBuilder().(*array.StringBuilder)
+
+	idbldr.Append("row-0")
+	attrBldr.Append(true)
+	attrKeyBldr.Append("a")
+	attrItemBldr.Append("1")
+
+	idbldr.Append("row-1")
+	attrBldr.Append(true)
+	attrKeyBldr.AppendValues([]string{"b", "c"}, nil)
+	attrItemBldr.AppendValues([]string{"2", "3"}, nil)
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	rr, err := array.NewRecordReader(arrowSch, []arrow.RecordBatch{rec})
+	require.NoError(t, err)
+	defer rr.Release()
+
+	result, err := tbl.Append(ctx, rr, nil)
+	require.NoError(t, err)
+
+	resultTbl, err := result.Scan().ToArrowTable(ctx)
+	require.NoError(t, err)
+	defer resultTbl.Release()
+
+	expectedSchema, err := table.SchemaToArrowSchema(iceSch, nil, false, false)
+	require.NoError(t, err)
+	expected, err := array.TableFromJSON(mem, expectedSchema, []string{
+		`[
+			{"id": "row-0", "attrs": [{"key": "a", "value": "1"}]},
+			{"id": "row-1", "attrs": [{"key": "b", "value": "2"}, {"key": "c", "value": "3"}]}
+		]`,
+	})
+	require.NoError(t, err)
+	defer expected.Release()
+
+	require.True(t, array.TableEqual(expected, resultTbl), "expected:\n %s\ngot:\n %s", expected, resultTbl)
+}
+
 func (t *TableTestSuite) TestRefresh() {
 	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
 		"uri":          ":memory:",
@@ -1498,7 +1956,7 @@ func (t *TableTestSuite) TestRefresh() {
 	originalSchema := tbl.Schema()
 	originalSpec := tbl.Spec()
 
-	_, _, err = cat.CommitTable(context.Background(), tbl, nil, []table.Update{
+	_, _, err = cat.CommitTable(context.Background(), tbl.Identifier(), nil, []table.Update{
 		table.NewSetPropertiesUpdate(iceberg.Properties{
 			"refreshed": "true",
 			"timestamp": strconv.FormatInt(time.Now().Unix(), 10),
@@ -1517,4 +1975,67 @@ func (t *TableTestSuite) TestRefresh() {
 	t.Equal(originalLocation, tbl.Location())
 	t.True(originalSchema.Equals(tbl.Schema()))
 	t.Equal(originalSpec, tbl.Spec())
+}
+
+func (t *TableTestSuite) TestMetadataCompressionRoundTrip() {
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + t.T().TempDir(),
+	})
+	t.Require().NoError(err)
+
+	ident := table.Identifier{"test", "compression_table"}
+	t.Require().NoError(cat.CreateNamespace(context.Background(), catalog.NamespaceFromIdent(ident), nil))
+
+	// Test with gzip compression enabled
+	tbl, err := cat.CreateTable(context.Background(), ident, t.tbl.Schema(),
+		catalog.WithProperties(iceberg.Properties{
+			table.MetadataCompressionKey: "gzip",
+		}))
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl)
+
+	// Verify the metadata location has the correct extension for gzipped files
+	metadataLoc := tbl.MetadataLocation()
+	t.Contains(metadataLoc, ".gz.metadata.json")
+
+	// Test that we can read the gzipped metadata
+	fs, err := tbl.FS(context.Background())
+	t.Require().NoError(err)
+
+	// Read the metadata file and verify it's gzipped
+	file, err := fs.Open(metadataLoc)
+	t.Require().NoError(err)
+	defer file.Close()
+
+	metadataBytes, err := io.ReadAll(file)
+	t.Require().NoError(err)
+
+	// Verify it's gzipped by trying to decompress it
+	gzReader, err := gzip.NewReader(bytes.NewReader(metadataBytes))
+	t.Require().NoError(err)
+	defer gzReader.Close()
+
+	decompressed, err := io.ReadAll(gzReader)
+	t.Require().NoError(err)
+
+	// Verify the decompressed content is valid JSON
+	var metadata map[string]any
+	err = json.Unmarshal(decompressed, &metadata)
+	t.Require().NoError(err)
+
+	// Verify it contains expected Iceberg metadata fields
+	t.Contains(metadata, "format-version")
+	t.Contains(metadata, "table-uuid")
+	t.Contains(metadata, "location")
+
+	// Verify that we can load the table from the metadata location
+	tbl2, err := cat.LoadTable(context.Background(), ident)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(tbl.Equals(*tbl2))
 }

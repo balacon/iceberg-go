@@ -24,9 +24,9 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/compute/exprs"
 	"github.com/apache/iceberg-go"
-	"github.com/substrait-io/substrait-go/v4/expr"
-	"github.com/substrait-io/substrait-go/v4/extensions"
-	"github.com/substrait-io/substrait-go/v4/types"
+	"github.com/substrait-io/substrait-go/v7/expr"
+	"github.com/substrait-io/substrait-go/v7/extensions"
+	"github.com/substrait-io/substrait-go/v7/types"
 )
 
 //go:embed functions_set.yaml
@@ -34,7 +34,7 @@ var funcsetYAML string
 
 var (
 	collection = extensions.GetDefaultCollectionWithNoError()
-	funcSetURI = "https://github.com/apache/iceberg-go/blob/main/table/substrait/functions_set.yaml"
+	funcSetURI = "extension:apache.iceberg:functions_set"
 )
 
 func init() {
@@ -80,7 +80,7 @@ func ConvertSchema(schema *iceberg.Schema) (res types.NamedStruct, err error) {
 
 	typ, err = iceberg.Visit(schema, convertToSubstrait{})
 	if err != nil {
-		return
+		return res, err
 	}
 
 	val := typ.(*types.StructType)
@@ -91,7 +91,7 @@ func ConvertSchema(schema *iceberg.Schema) (res types.NamedStruct, err error) {
 		res.Names[i] = f.Name
 	}
 
-	return
+	return res, err
 }
 
 type convertToSubstrait struct{}
@@ -144,40 +144,53 @@ func (convertToSubstrait) VisitDecimal(d iceberg.DecimalType) types.Type {
 	return &types.DecimalType{Precision: int32(d.Precision()), Scale: int32(d.Scale())}
 }
 
-func (convertToSubstrait) VisitBoolean() types.Type     { return &types.BooleanType{} }
-func (convertToSubstrait) VisitInt32() types.Type       { return &types.Int32Type{} }
-func (convertToSubstrait) VisitInt64() types.Type       { return &types.Int64Type{} }
-func (convertToSubstrait) VisitFloat32() types.Type     { return &types.Float32Type{} }
-func (convertToSubstrait) VisitFloat64() types.Type     { return &types.Float64Type{} }
-func (convertToSubstrait) VisitDate() types.Type        { return &types.DateType{} }
-func (convertToSubstrait) VisitTime() types.Type        { return &types.TimeType{} }
-func (convertToSubstrait) VisitTimestamp() types.Type   { return &types.TimestampType{} }
+func (convertToSubstrait) VisitBoolean() types.Type   { return &types.BooleanType{} }
+func (convertToSubstrait) VisitInt32() types.Type     { return &types.Int32Type{} }
+func (convertToSubstrait) VisitInt64() types.Type     { return &types.Int64Type{} }
+func (convertToSubstrait) VisitFloat32() types.Type   { return &types.Float32Type{} }
+func (convertToSubstrait) VisitFloat64() types.Type   { return &types.Float64Type{} }
+func (convertToSubstrait) VisitDate() types.Type      { return &types.DateType{} }
+func (convertToSubstrait) VisitTime() types.Type      { return &types.TimeType{} }
+func (convertToSubstrait) VisitTimestamp() types.Type { return &types.TimestampType{} }
+func (convertToSubstrait) VisitTimestampNs() types.Type {
+	return &types.PrecisionTimestampType{Precision: types.PrecisionNanoSeconds}
+}
 func (convertToSubstrait) VisitTimestampTz() types.Type { return &types.TimestampTzType{} }
-func (convertToSubstrait) VisitString() types.Type      { return &types.StringType{} }
-func (convertToSubstrait) VisitBinary() types.Type      { return &types.BinaryType{} }
-func (convertToSubstrait) VisitUUID() types.Type        { return &types.UUIDType{} }
+func (convertToSubstrait) VisitTimestampNsTz() types.Type {
+	return &types.PrecisionTimestampTzType{
+		PrecisionTimestampType: types.PrecisionTimestampType{Precision: types.PrecisionNanoSeconds},
+	}
+}
+func (convertToSubstrait) VisitString() types.Type { return &types.StringType{} }
+func (convertToSubstrait) VisitBinary() types.Type { return &types.BinaryType{} }
+func (convertToSubstrait) VisitUUID() types.Type   { return &types.UUIDType{} }
+func (convertToSubstrait) VisitUnknown() types.Type {
+	// Unknown types cannot be stored in data files and have no Substrait equivalent
+	// Returning nil indicates this type cannot be converted to Substrait
+	return nil
+}
 
 var _ iceberg.SchemaVisitorPerPrimitiveType[types.Type] = (*convertToSubstrait)(nil)
 
 var (
-	boolURI    = extensions.SubstraitDefaultURIPrefix + "functions_boolean.yaml"
-	compareURI = extensions.SubstraitDefaultURIPrefix + "functions_comparison.yaml"
-	stringURI  = extensions.SubstraitDefaultURIPrefix + "functions_string.yaml"
+	boolURI    = extensions.SubstraitDefaultURNPrefix + "functions_boolean"
+	compareURI = extensions.SubstraitDefaultURNPrefix + "functions_comparison"
+	stringURI  = extensions.SubstraitDefaultURNPrefix + "functions_string"
 
-	notID          = extensions.ID{URI: boolURI, Name: "not"}
-	andID          = extensions.ID{URI: boolURI, Name: "and"}
-	orID           = extensions.ID{URI: boolURI, Name: "or"}
-	isNaNID        = extensions.ID{URI: compareURI, Name: "is_nan"}
-	isNullID       = extensions.ID{URI: compareURI, Name: "is_null"}
-	isNotNullID    = extensions.ID{URI: compareURI, Name: "is_not_null"}
-	equalID        = extensions.ID{URI: compareURI, Name: "equal"}
-	notEqualID     = extensions.ID{URI: compareURI, Name: "not_equal"}
-	greaterEqualID = extensions.ID{URI: compareURI, Name: "gte"}
-	greaterID      = extensions.ID{URI: compareURI, Name: "gt"}
-	lessEqualID    = extensions.ID{URI: compareURI, Name: "lte"}
-	lessID         = extensions.ID{URI: compareURI, Name: "lt"}
-	startsWithID   = extensions.ID{URI: stringURI, Name: "starts_with"}
-	isInID         = extensions.ID{URI: funcSetURI, Name: "is_in"}
+	notID          = extensions.ID{URN: boolURI, Name: "not"}
+	andID          = extensions.ID{URN: boolURI, Name: "and"}
+	orID           = extensions.ID{URN: boolURI, Name: "or"}
+	isNaNID        = extensions.ID{URN: compareURI, Name: "is_nan"}
+	isNullID       = extensions.ID{URN: compareURI, Name: "is_null"}
+	isNotNullID    = extensions.ID{URN: compareURI, Name: "is_not_null"}
+	equalID        = extensions.ID{URN: compareURI, Name: "equal"}
+	notEqualID     = extensions.ID{URN: compareURI, Name: "not_equal"}
+	greaterEqualID = extensions.ID{URN: compareURI, Name: "gte"}
+	greaterID      = extensions.ID{URN: compareURI, Name: "gt"}
+	lessEqualID    = extensions.ID{URN: compareURI, Name: "lte"}
+	lessID         = extensions.ID{URN: compareURI, Name: "lt"}
+	startsWithID   = extensions.ID{URN: stringURI, Name: "starts_with"}
+	isInID         = extensions.ID{URN: funcSetURI, Name: "is_in"}
 )
 
 type toSubstraitExpr struct {

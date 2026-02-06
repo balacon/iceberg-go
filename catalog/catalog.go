@@ -68,12 +68,38 @@ type PropertiesUpdateSummary struct {
 	Missing []string `json:"missing"`
 }
 
+// commonCreateCfg represents common configuration to create table and view operations
+type commonCreateCfg struct {
+	Location   string
+	Properties iceberg.Properties
+}
+
 // CreateTableCfg represents the configuration used for CreateTable operations
 type CreateTableCfg struct {
-	Location      string
+	commonCreateCfg
 	PartitionSpec *iceberg.PartitionSpec
 	SortOrder     table.SortOrder
-	Properties    iceberg.Properties
+}
+
+func NewCreateTableCfg() CreateTableCfg {
+	return CreateTableCfg{
+		commonCreateCfg: commonCreateCfg{},
+		PartitionSpec:   nil,
+		SortOrder:       table.UnsortedSortOrder,
+	}
+}
+
+// CreateViewCfg represents the configuration used for CreateView operations
+type CreateViewCfg struct {
+	commonCreateCfg
+}
+
+func NewCreateViewCfg() CreateViewCfg {
+	return CreateViewCfg{
+		commonCreateCfg{
+			Properties: iceberg.Properties{},
+		},
+	}
 }
 
 // Catalog for iceberg table operations like create, drop, load, list and others.
@@ -86,12 +112,12 @@ type Catalog interface {
 	// and custom properties.
 	CreateTable(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, opts ...CreateTableOpt) (*table.Table, error)
 	// CommitTable commits the table metadata and updates to the catalog, returning the new metadata
-	CommitTable(context.Context, *table.Table, []table.Requirement, []table.Update) (table.Metadata, string, error)
+	CommitTable(ctx context.Context, identifier table.Identifier, requirements []table.Requirement, updates []table.Update) (table.Metadata, string, error)
 	// ListTables returns a list of table identifiers in the catalog, with the returned
 	// identifiers containing the information required to load the table via that catalog.
 	ListTables(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error]
 	// LoadTable loads a table from the catalog and returns a Table with the metadata.
-	LoadTable(ctx context.Context, identifier table.Identifier, props iceberg.Properties) (*table.Table, error)
+	LoadTable(ctx context.Context, identifier table.Identifier) (*table.Table, error)
 	// DropTable tells the catalog to drop the table entirely.
 	DropTable(ctx context.Context, identifier table.Identifier) error
 	// RenameTable tells the catalog to rename a given table by the identifiers
@@ -163,6 +189,20 @@ func WithSortOrder(order table.SortOrder) CreateTableOpt {
 func WithProperties(props iceberg.Properties) CreateTableOpt {
 	return func(cfg *CreateTableCfg) {
 		cfg.Properties = props
+	}
+}
+
+type CreateViewOpt func(*CreateViewCfg)
+
+func WithViewLocation(location string) CreateViewOpt {
+	return func(cfg *CreateViewCfg) {
+		cfg.Location = strings.TrimRight(location, "/")
+	}
+}
+
+func WithViewProperties(config iceberg.Properties) CreateViewOpt {
+	return func(cfg *CreateViewCfg) {
+		cfg.Properties = config
 	}
 }
 

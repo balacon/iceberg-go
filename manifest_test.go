@@ -19,6 +19,7 @@ package iceberg
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -54,6 +55,25 @@ var (
 			7989, 0, snapshotID).
 			Content(ManifestContentDeletes).
 			SequenceNum(3, 3).
+			AddedFiles(3).
+			ExistingFiles(0).
+			DeletedFiles(0).
+			AddedRows(addedRows).
+			ExistingRows(0).
+			DeletedRows(0).
+			Partitions([]FieldSummary{{
+				ContainsNull: true,
+				ContainsNaN:  &falseBool,
+				LowerBound:   &[]byte{0x01, 0x00, 0x00, 0x00},
+				UpperBound:   &[]byte{0x02, 0x00, 0x00, 0x00},
+			}}).Build(),
+	}
+
+	manifestFileRecordsV3 = []ManifestFile{
+		NewManifestFile(3, "/home/iceberg/warehouse/nyc/taxis_partitioned/metadata/0125c686-8aa6-4502-bdcc-b6d17ca41a3b-m0.avro",
+			7989, 0, snapshotID).
+			Content(ManifestContentData).
+			SequenceNum(5, 5).
 			AddedFiles(3).
 			ExistingFiles(0).
 			DeletedFiles(0).
@@ -330,8 +350,8 @@ var (
 		},
 	}
 
-	dataRecord0 = manifestEntryV1Records[0].Data.(extendedDataFile)
-	dataRecord1 = manifestEntryV1Records[1].Data.(extendedDataFile)
+	dataRecord0 = *manifestEntryV1Records[0].Data.(*extendedDataFile)
+	dataRecord1 = *manifestEntryV1Records[1].Data.(*extendedDataFile)
 
 	manifestEntryV2Records = []*manifestEntry{
 		{
@@ -380,6 +400,58 @@ var (
 		},
 	}
 
+	testFirstRowID         int64 = 1000
+	manifestEntryV3Records       = []*manifestEntry{
+		{
+			EntryStatus: EntryStatusADDED,
+			Snapshot:    &entrySnapshotID,
+			Data: &extendedDataFile{
+				dataFileImm: &dataFileImm{
+					Content:          EntryContentData,
+					Path:             dataRecord0.Path,
+					Format:           dataRecord0.Format,
+					PartitionData:    dataRecord0.PartitionData,
+					RecordCount:      dataRecord0.RecordCount,
+					FileSize:         dataRecord0.FileSize,
+					BlockSizeInBytes: dataRecord0.BlockSizeInBytes,
+					ColSizes:         dataRecord0.ColSizes,
+					ValCounts:        dataRecord0.ValCounts,
+					NullCounts:       dataRecord0.NullCounts,
+					NaNCounts:        dataRecord0.NaNCounts,
+					LowerBounds:      dataRecord0.LowerBounds,
+					UpperBounds:      dataRecord0.UpperBounds,
+					Splits:           dataRecord0.Splits,
+					SortOrder:        dataRecord0.SortOrder,
+					FirstRowIDField:  &testFirstRowID,
+				},
+			},
+		},
+		{
+			EntryStatus: EntryStatusADDED,
+			Snapshot:    &entrySnapshotID,
+			Data: &extendedDataFile{
+				dataFileImm: &dataFileImm{
+					Content:          EntryContentData,
+					Path:             dataRecord1.Path,
+					Format:           dataRecord1.Format,
+					PartitionData:    dataRecord1.PartitionData,
+					RecordCount:      dataRecord1.RecordCount,
+					FileSize:         dataRecord1.FileSize,
+					BlockSizeInBytes: dataRecord1.BlockSizeInBytes,
+					ColSizes:         dataRecord1.ColSizes,
+					ValCounts:        dataRecord1.ValCounts,
+					NullCounts:       dataRecord1.NullCounts,
+					NaNCounts:        dataRecord1.NaNCounts,
+					LowerBounds:      dataRecord1.LowerBounds,
+					UpperBounds:      dataRecord1.UpperBounds,
+					Splits:           dataRecord1.Splits,
+					SortOrder:        dataRecord1.SortOrder,
+					FirstRowIDField:  &testFirstRowID,
+				},
+			},
+		},
+	}
+
 	testSchema = NewSchema(0,
 		NestedField{ID: 1, Name: "VendorID", Type: PrimitiveTypes.Int32, Required: true},
 		NestedField{ID: 2, Name: "tpep_pickup_datetime", Type: PrimitiveTypes.Timestamp, Required: true},
@@ -411,12 +483,18 @@ type ManifestTestSuite struct {
 
 	v2ManifestList    bytes.Buffer
 	v2ManifestEntries bytes.Buffer
+
+	v3ManifestList    bytes.Buffer
+	v3ManifestEntries bytes.Buffer
 }
 
 func (m *ManifestTestSuite) writeManifestList() {
-	m.Require().NoError(WriteManifestList(1, &m.v1ManifestList, snapshotID, nil, nil, manifestFileRecordsV1))
+	m.Require().NoError(WriteManifestList(1, &m.v1ManifestList, snapshotID, nil, nil, 0, manifestFileRecordsV1))
 	unassignedSequenceNum := int64(-1)
-	m.Require().NoError(WriteManifestList(2, &m.v2ManifestList, snapshotID, nil, &unassignedSequenceNum, manifestFileRecordsV2))
+	m.Require().NoError(WriteManifestList(2, &m.v2ManifestList, snapshotID, nil, &unassignedSequenceNum, 0, manifestFileRecordsV2))
+	v3SequenceNum := int64(5)
+	firstRowID := int64(1000)
+	m.Require().NoError(WriteManifestList(3, &m.v3ManifestList, snapshotID, nil, &v3SequenceNum, firstRowID, manifestFileRecordsV3))
 }
 
 func (m *ManifestTestSuite) writeManifestEntries() {
@@ -428,6 +506,11 @@ func (m *ManifestTestSuite) writeManifestEntries() {
 	manifestEntryV2Recs := make([]ManifestEntry, len(manifestEntryV2Records))
 	for i, rec := range manifestEntryV2Records {
 		manifestEntryV2Recs[i] = rec
+	}
+
+	manifestEntryV3Recs := make([]ManifestEntry, len(manifestEntryV3Records))
+	for i, rec := range manifestEntryV3Records {
+		manifestEntryV3Recs[i] = rec
 	}
 
 	partitionSpec := NewPartitionSpecID(1,
@@ -445,6 +528,12 @@ func (m *ManifestTestSuite) writeManifestEntries() {
 	m.Require().NoError(err)
 
 	m.EqualValues(m.v2ManifestEntries.Len(), mf.Length())
+
+	mf, err = WriteManifest("/home/iceberg/warehouse/nyc/taxis_partitioned/metadata/0125c686-8aa6-4502-bdcc-b6d17ca41a3b-m0.avro",
+		&m.v3ManifestEntries, 3, partitionSpec, testSchema, entrySnapshotID, manifestEntryV3Recs)
+	m.Require().NoError(err)
+
+	m.EqualValues(m.v3ManifestEntries.Len(), mf.Length())
 }
 
 func (m *ManifestTestSuite) SetupSuite() {
@@ -655,6 +744,37 @@ func (m *ManifestTestSuite) TestReadManifestListV2() {
 	m.Equal([]byte{0x02, 0x00, 0x00, 0x00}, *part.UpperBound)
 }
 
+func (m *ManifestTestSuite) TestReadManifestListV3() {
+	list, err := ReadManifestList(&m.v3ManifestList)
+	m.Require().NoError(err)
+
+	m.Equal("/home/iceberg/warehouse/nyc/taxis_partitioned/metadata/0125c686-8aa6-4502-bdcc-b6d17ca41a3b-m0.avro", list[0].FilePath())
+	m.Len(list, 1)
+	m.Equal(3, list[0].Version())
+	m.EqualValues(7989, list[0].Length())
+	m.Equal(ManifestContentData, list[0].ManifestContent())
+	m.EqualValues(5, list[0].SequenceNum())
+	m.EqualValues(5, list[0].MinSequenceNum())
+
+	m.EqualValues(9182715666859759686, list[0].SnapshotID())
+	m.EqualValues(3, list[0].AddedDataFiles())
+	m.True(list[0].HasAddedFiles())
+	m.Zero(list[0].ExistingDataFiles())
+	m.False(list[0].HasExistingFiles())
+	m.Zero(list[0].DeletedDataFiles())
+	m.Equal(addedRows, list[0].AddedRows())
+	m.Zero(list[0].ExistingRows())
+	m.Zero(list[0].DeletedRows())
+	m.Nil(list[0].KeyMetadata())
+	m.Zero(list[0].PartitionSpecID())
+
+	part := list[0].Partitions()[0]
+	m.True(part.ContainsNull)
+	m.False(*part.ContainsNaN)
+	m.Equal([]byte{0x01, 0x00, 0x00, 0x00}, *part.LowerBound)
+	m.Equal([]byte{0x02, 0x00, 0x00, 0x00}, *part.UpperBound)
+}
+
 func (m *ManifestTestSuite) TestReadManifestListIncompleteSchema() {
 	// This prevents a regression that could be caused by using a schema cache
 	// across multiple read/write operations of an avro file. While it may sound
@@ -667,7 +787,7 @@ func (m *ManifestTestSuite) TestReadManifestListIncompleteSchema() {
 	// any cache. (Note: if working correctly, this will have no such side effect.)
 	var buf bytes.Buffer
 	seqNum := int64(9876)
-	err := WriteManifestList(2, &buf, 1234, nil, &seqNum, []ManifestFile{
+	err := WriteManifestList(2, &buf, 1234, nil, &seqNum, 0, []ManifestFile{
 		NewManifestFile(2, "s3://bucket/namespace/table/metadata/abcd-0123.avro", 99, 0, 1234).Build(),
 	})
 	m.NoError(err)
@@ -823,6 +943,8 @@ func (m *ManifestTestSuite) TestReadManifestIncompleteSchema() {
 		"s3://bucket/namespace/table/data/abcd-0123.parquet",
 		ParquetFile,
 		map[int]any{},
+		map[int]avro.LogicalType{},
+		map[int]int{},
 		100,
 		100*1000*1000,
 	)
@@ -1080,6 +1202,86 @@ func (m *ManifestTestSuite) TestManifestEntriesV2() {
 	m.Zero(*datafile.SortOrderID())
 }
 
+func (m *ManifestTestSuite) TestManifestEntriesV3() {
+	manifest := manifestFile{
+		version: 3,
+		SpecID:  1,
+		Path:    manifestFileRecordsV3[0].FilePath(),
+	}
+	partitionSpec := NewPartitionSpecID(1,
+		PartitionField{FieldID: 1000, SourceID: 1, Name: "VendorID", Transform: IdentityTransform{}},
+		PartitionField{FieldID: 1001, SourceID: 2, Name: "tpep_pickup_datetime", Transform: IdentityTransform{}})
+	mockedFile := &internal.MockFile{
+		Contents: bytes.NewReader(m.v3ManifestEntries.Bytes()),
+	}
+	manifestReader, err := NewManifestReader(&manifest, mockedFile)
+	m.Require().NoError(err)
+	m.Equal(3, manifestReader.Version())
+	m.Equal(ManifestContentData, manifestReader.ManifestContent())
+	loadedSchema, err := manifestReader.Schema()
+	m.Require().NoError(err)
+	m.True(loadedSchema.Equals(testSchema))
+	loadedPartitionSpec, err := manifestReader.PartitionSpec()
+	m.Require().NoError(err)
+	m.True(loadedPartitionSpec.Equals(partitionSpec))
+	entry1, err := manifestReader.ReadEntry()
+	m.Require().NoError(err)
+	_, err = manifestReader.ReadEntry()
+	m.Require().NoError(err)
+	_, err = manifestReader.ReadEntry()
+	m.Require().ErrorIs(err, io.EOF)
+	m.Equal(int32(1), manifest.PartitionSpecID())
+	m.Zero(manifest.SnapshotID())
+	m.Zero(manifest.AddedDataFiles())
+	m.Zero(manifest.ExistingDataFiles())
+	m.Zero(manifest.DeletedDataFiles())
+	m.Zero(manifest.ExistingRows())
+	m.Zero(manifest.DeletedRows())
+	m.Zero(manifest.AddedRows())
+	m.Equal(EntryStatusADDED, entry1.Status())
+	m.Equal(entrySnapshotID, entry1.SnapshotID())
+	m.Zero(entry1.SequenceNum())
+	m.Zero(*entry1.FileSequenceNum())
+	datafile := entry1.DataFile()
+	m.Equal(EntryContentData, datafile.ContentType())
+	m.Equal("/home/iceberg/warehouse/nyc/taxis_partitioned/data/VendorID=null/00000-633-d8a4223e-dc97-45a1-86e1-adaba6e8abd7-00001.parquet", datafile.FilePath())
+	m.Equal(ParquetFile, datafile.FileFormat())
+	m.EqualValues(19513, datafile.Count())
+	m.EqualValues(388872, datafile.FileSizeBytes())
+	// Test v3-specific fields
+	m.NotNil(datafile.FirstRowID())
+	m.EqualValues(testFirstRowID, *datafile.FirstRowID())
+	m.Nil(datafile.ReferencedDataFile()) // Only for position delete files
+	m.Nil(datafile.ContentOffset())
+	m.Nil(datafile.ContentSizeInBytes())
+	// Verify existing fields still work
+	m.Equal(map[int]int64{
+		1:  53,
+		2:  98153,
+		3:  98693,
+		4:  53,
+		5:  53,
+		6:  53,
+		7:  17425,
+		8:  18528,
+		9:  53,
+		10: 44788,
+		11: 35571,
+		12: 53,
+		13: 1243,
+		14: 2355,
+		15: 12750,
+		16: 4029,
+		17: 110,
+		18: 47194,
+		19: 2948,
+	}, datafile.ColumnSizes())
+	m.Nil(datafile.KeyMetadata())
+	m.Equal([]int64{4}, datafile.SplitOffsets())
+	m.Nil(datafile.EqualityFieldIDs())
+	m.Zero(*datafile.SortOrderID())
+}
+
 func (m *ManifestTestSuite) TestManifestEntryBuilder() {
 	dataFileBuilder, err := NewDataFileBuilder(
 		NewPartitionSpec(),
@@ -1087,6 +1289,8 @@ func (m *ManifestTestSuite) TestManifestEntryBuilder() {
 		"sample.parquet",
 		ParquetFile,
 		map[int]any{1001: int(1), 1002: time.Unix(1925, 0).UnixMicro()},
+		map[int]avro.LogicalType{},
+		map[int]int{},
 		1,
 		2,
 	)
@@ -1177,4 +1381,139 @@ func (m *ManifestTestSuite) TestManifestWriterMeta() {
 
 func TestManifests(t *testing.T) {
 	suite.Run(t, new(ManifestTestSuite))
+}
+
+func (m *ManifestTestSuite) TestV3ManifestListWriterRowIDTracking() {
+	// Test v3 ManifestListWriter NextRowID functionality
+	var buf bytes.Buffer
+	firstRowID := int64(5000)
+	sequenceNum := int64(10)
+	writer, err := NewManifestListWriterV3(&buf, snapshotID, sequenceNum, firstRowID, nil)
+	m.Require().NoError(err)
+	// Test NextRowID method
+	m.NotNil(writer.NextRowID())
+	m.EqualValues(firstRowID, *writer.NextRowID())
+	// Create test manifests with row counts
+	manifests := []ManifestFile{
+		NewManifestFile(3, "test1.avro", 100, 1, snapshotID).
+			AddedRows(1000).ExistingRows(500).Build(),
+		NewManifestFile(3, "test2.avro", 200, 1, snapshotID).
+			AddedRows(2000).ExistingRows(300).Build(),
+	}
+	// Add manifests - should update nextRowID
+	err = writer.AddManifests(manifests)
+	m.Require().NoError(err)
+	// NextRowID should have been incremented by total row counts
+	// manifest1: 1000 (added) + 500 (existing) = 1500
+	// manifest2: 2000 (added) + 300 (existing) = 2300
+	// Expected: 5000 + 1500 + 2300 = 8800
+	expectedNextRowID := firstRowID + 1500 + 2300
+	m.EqualValues(expectedNextRowID, *writer.NextRowID())
+	err = writer.Close()
+	m.Require().NoError(err)
+}
+
+func (m *ManifestTestSuite) TestV3PrepareEntrySequenceNumberValidation() {
+	// Test v3writerImpl.prepareEntry sequence number validation logic
+	v3Writer := v3writerImpl{}
+	snapshotID := int64(12345)
+	// Test case 1: Entry with nil sequence number and matching snapshot - should succeed
+	entry1 := &manifestEntry{
+		EntryStatus: EntryStatusADDED,
+		Snapshot:    &snapshotID,
+		SeqNum:      nil, // Will be inherited
+	}
+	result, err := v3Writer.prepareEntry(entry1, snapshotID)
+	m.Require().NoError(err)
+	m.Equal(entry1, result)
+	// Test case 2: Entry with nil sequence number but mismatched snapshot - should fail
+	differentSnapshot := int64(54321)
+	entry2 := &manifestEntry{
+		EntryStatus: EntryStatusADDED,
+		Snapshot:    &differentSnapshot,
+		SeqNum:      nil,
+	}
+	_, err = v3Writer.prepareEntry(entry2, snapshotID)
+	m.Require().Error(err)
+	m.Contains(err.Error(), "found unassigned sequence number for entry from snapshot")
+	// Test case 3: Entry with nil sequence number but not ADDED status - should fail
+	entry3 := &manifestEntry{
+		EntryStatus: EntryStatusEXISTING,
+		Snapshot:    &snapshotID,
+		SeqNum:      nil,
+	}
+	_, err = v3Writer.prepareEntry(entry3, snapshotID)
+	m.Require().Error(err)
+	m.Contains(err.Error(), "only entries with status ADDED can be missing a sequence number")
+	// Test case 4: Entry with assigned sequence number - should succeed
+	assignedSeqNum := int64(42)
+	entry4 := &manifestEntry{
+		EntryStatus: EntryStatusEXISTING,
+		Snapshot:    &snapshotID,
+		SeqNum:      &assignedSeqNum,
+	}
+	result, err = v3Writer.prepareEntry(entry4, snapshotID)
+	m.Require().NoError(err)
+	m.Equal(entry4, result)
+}
+
+var errLimitedWrite = errors.New("write limit exceeded")
+
+type limitedWriter struct {
+	limit   int
+	written int
+	err     error
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if w.written+len(p) > w.limit {
+		return 0, w.err
+	}
+	w.written += len(p)
+
+	return len(p), nil
+}
+
+func (m *ManifestTestSuite) TestWriteManifestListClosesWriterOnError() {
+	seqNum := int64(7)
+	var header bytes.Buffer
+	writer, err := NewManifestListWriterV2(&header, snapshotID, seqNum, nil)
+	m.Require().NoError(err)
+	m.Require().NoError(writer.Close())
+
+	out := &limitedWriter{limit: header.Len(), err: errLimitedWrite}
+	err = WriteManifestList(2, out, snapshotID, nil, &seqNum, 0, []ManifestFile{
+		manifestFileRecordsV2[0],
+		manifestFileRecordsV1[0],
+	})
+	m.Require().Error(err)
+	m.Require().ErrorContains(err, "ManifestListWriter only supports version 2 manifest files")
+	m.Require().ErrorIs(err, errLimitedWrite)
+}
+
+func (m *ManifestTestSuite) TestWriteManifestClosesWriterOnEntryError() {
+	partitionSpec := NewPartitionSpecID(1,
+		PartitionField{FieldID: 1000, SourceID: 1, Name: "VendorID", Transform: IdentityTransform{}},
+		PartitionField{FieldID: 1001, SourceID: 2, Name: "tpep_pickup_datetime", Transform: IdentityTransform{}})
+
+	var header bytes.Buffer
+	writer, err := NewManifestWriter(2, &header, partitionSpec, testSchema, entrySnapshotID)
+	m.Require().NoError(err)
+	headerLen := header.Len()
+
+	m.Require().NoError(writer.Add(manifestEntryV2Records[0]))
+	m.Require().NoError(writer.Close())
+
+	badEntry := *manifestEntryV2Records[1]
+	badEntry.EntryStatus = EntryStatusEXISTING
+	badEntry.SeqNum = nil
+
+	out := &limitedWriter{limit: headerLen, err: errLimitedWrite}
+	_, err = WriteManifest("test.avro", out, 2, partitionSpec, testSchema, entrySnapshotID, []ManifestEntry{
+		manifestEntryV2Records[0],
+		&badEntry,
+	})
+	m.Require().Error(err)
+	m.Require().ErrorContains(err, "only entries with status ADDED")
+	m.Require().ErrorIs(err, errLimitedWrite)
 }

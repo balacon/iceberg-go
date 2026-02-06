@@ -19,6 +19,7 @@ package internal
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -171,4 +172,17 @@ func Counter(start int) iter.Seq[int] {
 			start++
 		}
 	}
+}
+
+// CheckedClose is a helper function to close a resource and return an error if it fails.
+// It is intended to be used in a defer statement.
+func CheckedClose(c io.Closer, err *error) {
+	*err = errors.Join(*err, c.Close())
+}
+
+// SliceEqualHelper compares the equality of two slices whose elements have an Equals method
+func SliceEqualHelper[T interface{ Equals(T) bool }](s1, s2 []T) bool {
+	return slices.EqualFunc(s1, s2, func(t1, t2 T) bool {
+		return t1.Equals(t2)
+	})
 }

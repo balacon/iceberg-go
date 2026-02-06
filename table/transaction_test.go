@@ -117,7 +117,7 @@ func (s *SparkIntegrationTestSuite) TestSetProperties() {
 func (s *SparkIntegrationTestSuite) TestAddFile() {
 	const filename = "s3://warehouse/default/test_partitioned_by_days/data/ts_day=2023-03-13/supertest.parquet"
 
-	tbl, err := s.cat.LoadTable(s.ctx, catalog.ToIdentifier("default", "test_partitioned_by_days"), nil)
+	tbl, err := s.cat.LoadTable(s.ctx, catalog.ToIdentifier("default", "test_partitioned_by_days"))
 	s.Require().NoError(err)
 
 	sc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
@@ -144,7 +144,7 @@ func (s *SparkIntegrationTestSuite) TestAddFile() {
 	}
 	defer fw.Close()
 
-	if err := pqarrow.WriteTable(array.NewTableFromRecords(sc, []arrow.Record{rec}), fw, rec.NumRows(), parquet.NewWriterProperties(), pqarrow.DefaultWriterProps()); err != nil {
+	if err := pqarrow.WriteTable(array.NewTableFromRecords(sc, []arrow.RecordBatch{rec}), fw, rec.NumRows(), parquet.NewWriterProperties(), pqarrow.DefaultWriterProps()); err != nil {
 		panic(err)
 	}
 
@@ -189,9 +189,11 @@ func (s *SparkIntegrationTestSuite) TestDifferentDataTypes() {
 		iceberg.NestedField{ID: 14, Name: "small_dec", Type: iceberg.DecimalTypeOf(8, 2)},
 		iceberg.NestedField{ID: 15, Name: "med_dec", Type: iceberg.DecimalTypeOf(16, 2)},
 		iceberg.NestedField{ID: 16, Name: "large_dec", Type: iceberg.DecimalTypeOf(24, 2)},
-		iceberg.NestedField{ID: 17, Name: "list", Type: &iceberg.ListType{
-			ElementID: 18,
-			Element:   iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{
+			ID: 17, Name: "list", Type: &iceberg.ListType{
+				ElementID: 18,
+				Element:   iceberg.PrimitiveTypes.Int32,
+			},
 		},
 	)
 

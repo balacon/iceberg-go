@@ -40,6 +40,7 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/view"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -129,7 +130,7 @@ func (t *commitTableResponse) UnmarshalJSON(b []byte) (err error) {
 
 	t.Metadata, err = table.ParseMetadataBytes(t.RawMetadata)
 
-	return
+	return err
 }
 
 type loadTableResponse struct {
@@ -147,7 +148,7 @@ func (t *loadTableResponse) UnmarshalJSON(b []byte) (err error) {
 
 	t.Metadata, err = table.ParseMetadataBytes(t.RawMetadata)
 
-	return
+	return err
 }
 
 type createTableRequest struct {
@@ -160,41 +161,13 @@ type createTableRequest struct {
 	Props         iceberg.Properties     `json:"properties,omitempty"`
 }
 
-type oauthTokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
-	Scope        string `json:"scope"`
-	RefreshToken string `json:"refresh_token"`
-}
-
-type oauthErrorResponse struct {
-	Err     string `json:"error"`
-	ErrDesc string `json:"error_description"`
-	ErrURI  string `json:"error_uri"`
-}
-
-func (o oauthErrorResponse) Unwrap() error { return ErrOAuthError }
-func (o oauthErrorResponse) Error() string {
-	msg := o.Err
-	if o.ErrDesc != "" {
-		msg += ": " + o.ErrDesc
-	}
-
-	if o.ErrURI != "" {
-		msg += " (" + o.ErrURI + ")"
-	}
-
-	return msg
-}
-
 type configResponse struct {
 	Defaults  iceberg.Properties `json:"defaults"`
 	Overrides iceberg.Properties `json:"overrides"`
 }
 
 type sessionTransport struct {
-	http.Transport
+	http.RoundTripper
 
 	defaultHeaders http.Header
 	signer         v4.HTTPSigner
@@ -208,6 +181,11 @@ const emptyStringHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991
 
 func (s *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	for k, v := range s.defaultHeaders {
+		// Skip Content-Type if it's already set in the request
+		// to avoid duplicate headers (e.g., when using PostForm)
+		if http.CanonicalHeaderKey(k) == "Content-Type" && r.Header.Get("Content-Type") != "" {
+			continue
+		}
 		for _, hdr := range v {
 			r.Header.Add(k, hdr)
 		}
@@ -236,6 +214,10 @@ func (s *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 
+		// Set the x-amz-content-sha256 header before signing.
+		// This header is required for AWS SigV4 signature verification.
+		r.Header.Set("x-amz-content-sha256", payloadHash)
+
 		// modifies the request in place
 		err = s.signer.SignHTTP(r.Context(), creds, r, payloadHash,
 			s.service, s.cfg.Region, time.Now())
@@ -244,7 +226,7 @@ func (s *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 
-	return s.Transport.RoundTrip(r)
+	return s.RoundTripper.RoundTrip(r)
 }
 
 func do[T any](ctx context.Context, method string, baseURI *url.URL, path []string, cl *http.Client, override map[int]error, allowNoContent bool) (ret T, err error) {
@@ -255,15 +237,19 @@ func do[T any](ctx context.Context, method string, baseURI *url.URL, path []stri
 
 	uri := baseURI.JoinPath(path...).String()
 	if req, err = http.NewRequestWithContext(ctx, method, uri, nil); err != nil {
-		return
+		return ret, err
 	}
 
 	if rsp, err = cl.Do(req); err != nil {
-		return
+		return ret, err
 	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, rsp.Body)
+		_ = rsp.Body.Close()
+	}()
 
 	if allowNoContent && rsp.StatusCode == http.StatusNoContent {
-		return
+		return ret, err
 	}
 
 	if rsp.StatusCode != http.StatusOK {
@@ -271,15 +257,14 @@ func do[T any](ctx context.Context, method string, baseURI *url.URL, path []stri
 	}
 
 	if method == http.MethodHead || method == http.MethodDelete {
-		return
+		return ret, err
 	}
 
-	defer rsp.Body.Close()
 	if err = json.NewDecoder(rsp.Body).Decode(&ret); err != nil {
 		return ret, fmt.Errorf("%w: error decoding json payload: `%s`", ErrRESTError, err.Error())
 	}
 
-	return
+	return ret, err
 }
 
 func doGet[T any](ctx context.Context, baseURI *url.URL, path []string, cl *http.Client, override map[int]error) (ret T, err error) {
@@ -297,6 +282,10 @@ func doHead(ctx context.Context, baseURI *url.URL, path []string, cl *http.Clien
 }
 
 func doPost[Payload, Result any](ctx context.Context, baseURI *url.URL, path []string, payload Payload, cl *http.Client, override map[int]error) (ret Result, err error) {
+	return doPostAllowNoContent[Payload, Result](ctx, baseURI, path, payload, cl, override, false)
+}
+
+func doPostAllowNoContent[Payload, Result any](ctx context.Context, baseURI *url.URL, path []string, payload Payload, cl *http.Client, override map[int]error, allowNoContent bool) (ret Result, err error) {
 	var (
 		req  *http.Request
 		rsp  *http.Response
@@ -306,17 +295,25 @@ func doPost[Payload, Result any](ctx context.Context, baseURI *url.URL, path []s
 	uri := baseURI.JoinPath(path...).String()
 	data, err = json.Marshal(payload)
 	if err != nil {
-		return
+		return ret, err
 	}
 
 	req, err = http.NewRequestWithContext(ctx, http.MethodPost, uri, bytes.NewReader(data))
 	if err != nil {
-		return
+		return ret, err
 	}
 
 	rsp, err = cl.Do(req)
 	if err != nil {
-		return
+		return ret, err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, rsp.Body)
+		_ = rsp.Body.Close()
+	}()
+
+	if allowNoContent && rsp.StatusCode == http.StatusNoContent {
+		return ret, err
 	}
 
 	if rsp.StatusCode != http.StatusOK {
@@ -324,24 +321,28 @@ func doPost[Payload, Result any](ctx context.Context, baseURI *url.URL, path []s
 	}
 
 	if rsp.ContentLength == 0 {
-		return
+		return ret, err
 	}
 
-	defer rsp.Body.Close()
 	if err = json.NewDecoder(rsp.Body).Decode(&ret); err != nil {
 		return ret, fmt.Errorf("%w: error decoding json payload: `%s`", ErrRESTError, err.Error())
 	}
 
-	return
+	return ret, err
 }
 
 func handleNon200(rsp *http.Response, override map[int]error) error {
 	var e errorResponse
 
-	dec := json.NewDecoder(rsp.Body)
-	dec.Decode(&struct {
-		Error *errorResponse `json:"error"`
-	}{Error: &e})
+	// Only try to decode if there's a body (HEAD requests don't have one)
+	if rsp.ContentLength != 0 {
+		decErr := json.NewDecoder(rsp.Body).Decode(&struct {
+			Error *errorResponse `json:"error"`
+		}{Error: &e})
+		if decErr != nil && decErr != io.EOF {
+			return fmt.Errorf("%w: failed to decode error response: %s", ErrRESTError, decErr.Error())
+		}
+	}
 
 	if override != nil {
 		if err, ok := override[rsp.StatusCode]; ok {
@@ -380,8 +381,6 @@ func handleNon200(rsp *http.Response, override map[int]error) error {
 func fromProps(props iceberg.Properties, o *options) {
 	for k, v := range props {
 		switch k {
-		case keyOauthToken:
-			o.oauthToken = v
 		case keyWarehouseLocation:
 			o.warehouseLocation = v
 		case keyMetadataLocation:
@@ -436,7 +435,6 @@ func toProps(o *options) iceberg.Properties {
 	}
 
 	setIf(keyOauthCredential, o.credential)
-	setIf(keyOauthToken, o.oauthToken)
 	setIf(keyWarehouseLocation, o.warehouseLocation)
 	setIf(keyMetadataLocation, o.metadataLocation)
 	if o.enableSigv4 {
@@ -479,12 +477,33 @@ func NewCatalog(ctx context.Context, name, uri string, opts ...Option) (*Catalog
 		o(ops)
 	}
 
+	if ops.tlsConfig != nil && ops.transport != nil {
+		return nil, errors.New("invalid catalog config with non-nil tlsConfig and transport: tlsConfig will be ignored, it should be added to the provided transport instead")
+	}
+
 	r := &Catalog{name: name}
 	if err := r.init(ctx, ops, uri); err != nil {
 		return nil, err
 	}
 
 	return r, nil
+}
+
+// setupOAuthManager creates an Oauth2AuthManager based on the provided options.
+// The allows users to set their token, credential, or just get the defaults if no auth manager is set.
+func setupOAuthManager(r *Catalog, cl *http.Client, opts *options) *Oauth2AuthManager {
+	authURI := opts.authUri
+	if authURI == nil {
+		authURI = r.baseURI.JoinPath("oauth/tokens")
+	}
+
+	return &Oauth2AuthManager{
+		Token:      opts.oauthToken,
+		Credential: opts.credential,
+		AuthURI:    authURI,
+		Scope:      opts.scope,
+		Client:     cl,
+	}
 }
 
 func (r *Catalog) init(ctx context.Context, ops *options, uri string) error {
@@ -506,82 +525,38 @@ func (r *Catalog) init(ctx context.Context, ops *options, uri string) error {
 	return nil
 }
 
-func (r *Catalog) fetchAccessToken(cl *http.Client, creds string, opts *options) (string, error) {
-	clientID, clientSecret, hasID := strings.Cut(creds, ":")
-	if !hasID {
-		clientID, clientSecret = "", clientID
-	}
-
-	scope := "catalog"
-	if opts.scope != "" {
-		scope = opts.scope
-	}
-	data := url.Values{
-		"grant_type":    {"client_credentials"},
-		"client_id":     {clientID},
-		"client_secret": {clientSecret},
-		"scope":         {scope},
-	}
-
-	uri := opts.authUri
-	if uri == nil {
-		uri = r.baseURI.JoinPath("oauth/tokens")
-	}
-
-	rsp, err := cl.PostForm(uri.String(), data)
-	if err != nil {
-		return "", err
-	}
-
-	if rsp.StatusCode == http.StatusOK {
-		defer rsp.Body.Close()
-		dec := json.NewDecoder(rsp.Body)
-		var tok oauthTokenResponse
-		if err := dec.Decode(&tok); err != nil {
-			return "", fmt.Errorf("failed to decode oauth token response: %w", err)
-		}
-
-		return tok.AccessToken, nil
-	}
-
-	switch rsp.StatusCode {
-	case http.StatusUnauthorized, http.StatusBadRequest:
-		defer rsp.Request.GetBody()
-		dec := json.NewDecoder(rsp.Body)
-		var oauthErr oauthErrorResponse
-		if err := dec.Decode(&oauthErr); err != nil {
-			return "", fmt.Errorf("failed to decode oauth error: %w", err)
-		}
-
-		return "", oauthErr
-	default:
-		return "", handleNon200(rsp, nil)
-	}
-}
-
 func (r *Catalog) createSession(ctx context.Context, opts *options) (*http.Client, error) {
 	session := &sessionTransport{
-		Transport:      http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: opts.tlsConfig},
 		defaultHeaders: http.Header{},
+	}
+	if opts.transport != nil {
+		session.RoundTripper = opts.transport
+	} else {
+		session.RoundTripper = &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: opts.tlsConfig}
 	}
 	cl := &http.Client{Transport: session}
 
-	token := opts.oauthToken
-	if token == "" && opts.credential != "" {
-		var err error
-		if token, err = r.fetchAccessToken(cl, opts.credential, opts); err != nil {
-			return nil, fmt.Errorf("auth error: %w", err)
-		}
-	}
-
-	if token != "" {
-		session.defaultHeaders.Set(authorizationHeader, bearerPrefix+" "+token)
+	// If the user does not set an AuthManager, we can construct an OAuth2AuthManager based off their options.
+	if opts.authManager == nil {
+		opts.authManager = setupOAuthManager(r, cl, opts)
 	}
 
 	session.defaultHeaders.Set("X-Client-Version", icebergRestSpecVersion)
 	session.defaultHeaders.Set("Content-Type", "application/json")
 	session.defaultHeaders.Set("User-Agent", "GoIceberg/"+iceberg.Version())
 	session.defaultHeaders.Set("X-Iceberg-Access-Delegation", "vended-credentials")
+
+	for k, v := range opts.headers {
+		session.defaultHeaders.Set(k, v)
+	}
+
+	if opts.authManager != nil {
+		k, v, err := opts.authManager.AuthHeader()
+		if err != nil {
+			return nil, err
+		}
+		session.defaultHeaders.Set(k, v)
+	}
 
 	if opts.enableSigv4 {
 		cfg := opts.awsConfig
@@ -737,32 +712,21 @@ func (r *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, 
 		return nil, err
 	}
 
-	var cfg catalog.CreateTableCfg
+	cfg := catalog.NewCreateTableCfg()
 	for _, o := range opts {
 		o(&cfg)
 	}
 
-	freshSchema, err := iceberg.AssignFreshSchemaIDs(schema, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	freshPartitionSpec, err := iceberg.AssignFreshPartitionSpecIDs(cfg.PartitionSpec, schema, freshSchema)
-	if err != nil {
-		return nil, err
-	}
-
-	freshSortOrder, err := table.AssignFreshSortOrderIDs(cfg.SortOrder, schema, freshSchema)
-	if err != nil {
-		return nil, err
+	if cfg.SortOrder.Fields() == nil && cfg.SortOrder.OrderID() == 0 {
+		cfg.SortOrder = table.UnsortedSortOrder
 	}
 
 	payload := createTableRequest{
 		Name:          tbl,
-		Schema:        freshSchema,
+		Schema:        schema,
 		Location:      cfg.Location,
-		PartitionSpec: &freshPartitionSpec,
-		WriteOrder:    &freshSortOrder,
+		PartitionSpec: cfg.PartitionSpec,
+		WriteOrder:    &cfg.SortOrder,
 		StageCreate:   false,
 		Props:         cfg.Properties,
 	}
@@ -780,9 +744,7 @@ func (r *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, 
 	return r.tableFromResponse(ctx, identifier, ret.Metadata, ret.MetadataLoc, config)
 }
 
-func (r *Catalog) CommitTable(ctx context.Context, tbl *table.Table, requirements []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
-	ident := tbl.Identifier()
-
+func (r *Catalog) CommitTable(ctx context.Context, ident table.Identifier, requirements []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
 	ns, tblName, err := splitIdentForPath(ident)
 	if err != nil {
 		return nil, "", err
@@ -823,7 +785,7 @@ func (r *Catalog) RegisterTable(ctx context.Context, identifier table.Identifier
 		MetadataLoc string `json:"metadata-location"`
 	}
 
-	ret, err := doPost[payload, loadTableResponse](ctx, r.baseURI, []string{"namespaces", ns, "tables", tbl},
+	ret, err := doPost[payload, loadTableResponse](ctx, r.baseURI, []string{"namespaces", ns, "register"},
 		payload{Name: tbl, MetadataLoc: metadataLoc}, r.cl, map[int]error{
 			http.StatusNotFound: catalog.ErrNoSuchNamespace, http.StatusConflict: catalog.ErrTableAlreadyExists,
 		})
@@ -838,7 +800,7 @@ func (r *Catalog) RegisterTable(ctx context.Context, identifier table.Identifier
 	return r.tableFromResponse(ctx, identifier, ret.Metadata, ret.MetadataLoc, config)
 }
 
-func (r *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, props iceberg.Properties) (*table.Table, error) {
+func (r *Catalog) LoadTable(ctx context.Context, identifier table.Identifier) (*table.Table, error) {
 	ns, tbl, err := splitIdentForPath(identifier)
 	if err != nil {
 		return nil, err
@@ -851,7 +813,6 @@ func (r *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 	}
 
 	config := maps.Clone(r.props)
-	maps.Copy(config, props)
 	maps.Copy(config, ret.Metadata.Properties())
 	for k, v := range ret.Config {
 		config[k] = v
@@ -931,13 +892,13 @@ func (r *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (*
 		Name:      catalog.TableNameFromIdent(to),
 	}
 
-	_, err := doPost[payload, any](ctx, r.baseURI, []string{"tables", "rename"}, payload{Source: src, Destination: dst}, r.cl,
-		map[int]error{http.StatusNotFound: catalog.ErrNoSuchTable})
+	_, err := doPostAllowNoContent[payload, any](ctx, r.baseURI, []string{"tables", "rename"}, payload{Source: src, Destination: dst}, r.cl,
+		map[int]error{http.StatusNotFound: catalog.ErrNoSuchTable}, true)
 	if err != nil {
 		return nil, err
 	}
 
-	return r.LoadTable(ctx, to, nil)
+	return r.LoadTable(ctx, to)
 }
 
 func (r *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifier, props iceberg.Properties) error {
@@ -965,23 +926,53 @@ func (r *Catalog) DropNamespace(ctx context.Context, namespace table.Identifier)
 }
 
 func (r *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) ([]table.Identifier, error) {
+	var allNamespaces []table.Identifier
+	pageSize := r.getPageSize(ctx)
+	var pageToken string
+
+	for {
+		namespaces, nextPageToken, err := r.listNamespacesPage(ctx, parent, pageToken, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		allNamespaces = append(allNamespaces, namespaces...)
+		if nextPageToken == "" {
+			break
+		}
+		pageToken = nextPageToken
+	}
+
+	return allNamespaces, nil
+}
+
+func (r *Catalog) listNamespacesPage(ctx context.Context, parent table.Identifier, pageToken string, pageSize int) ([]table.Identifier, string, error) {
 	uri := r.baseURI.JoinPath("namespaces")
+
+	v := url.Values{}
 	if len(parent) != 0 {
-		v := url.Values{}
 		v.Set("parent", strings.Join(parent, namespaceSeparator))
+	}
+	if pageSize >= 0 {
+		v.Set("pageSize", strconv.Itoa(pageSize))
+	}
+	if pageToken != "" {
+		v.Set("pageToken", pageToken)
+	}
+	if len(v) > 0 {
 		uri.RawQuery = v.Encode()
 	}
 
 	type rsptype struct {
-		Namespaces []table.Identifier `json:"namespaces"`
+		Namespaces    []table.Identifier `json:"namespaces"`
+		NextPageToken string             `json:"next-page-token,omitempty"`
 	}
 
 	rsp, err := doGet[rsptype](ctx, uri, []string{}, r.cl, map[int]error{http.StatusNotFound: catalog.ErrNoSuchNamespace})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	return rsp.Namespaces, nil
+	return rsp.Namespaces, rsp.NextPageToken, nil
 }
 
 func (r *Catalog) LoadNamespaceProperties(ctx context.Context, namespace table.Identifier) (iceberg.Properties, error) {
@@ -1159,78 +1150,136 @@ func (r *Catalog) CheckViewExists(ctx context.Context, identifier table.Identifi
 	return true, nil
 }
 
-type viewVersion struct {
-	VersionID       int64             `json:"version-id"`
-	TimestampMs     int64             `json:"timestamp-ms"`
-	SchemaID        int               `json:"schema-id"`
-	Summary         map[string]string `json:"summary"`
-	Representations []struct {
-		Type    string `json:"type"`
-		SQL     string `json:"sql"`
-		Dialect string `json:"dialect"`
-	} `json:"representations"`
-	DefaultCatalog   string   `json:"default-catalog"`
-	DefaultNamespace []string `json:"default-namespace"`
-}
-
 type createViewRequest struct {
 	Name        string             `json:"name"`
 	Schema      *iceberg.Schema    `json:"schema"`
 	Location    string             `json:"location,omitempty"`
-	Props       iceberg.Properties `json:"properties,omitempty"`
-	SQL         string             `json:"sql"`
-	ViewVersion viewVersion        `json:"view-version"`
+	Props       iceberg.Properties `json:"properties"`
+	ViewVersion *view.Version      `json:"view-version"`
 }
 
 type viewResponse struct {
 	MetadataLoc string             `json:"metadata-location"`
 	RawMetadata json.RawMessage    `json:"metadata"`
 	Config      iceberg.Properties `json:"config"`
-	Metadata    table.Metadata     `json:"-"`
+	Metadata    view.Metadata      `json:"-"`
+}
+
+func (v *viewResponse) UnmarshalJSON(b []byte) (err error) {
+	type Alias viewResponse
+	if err = json.Unmarshal(b, (*Alias)(v)); err != nil {
+		return err
+	}
+
+	v.Metadata, err = view.ParseMetadataBytes(v.RawMetadata)
+
+	return
 }
 
 // CreateView creates a new view in the catalog.
-func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, sql string, props iceberg.Properties) error {
-	ns, view, err := splitIdentForPath(identifier)
+func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, version *view.Version, schema *iceberg.Schema, opts ...catalog.CreateViewOpt) (*view.View, error) {
+	ns, viewName, err := splitIdentForPath(identifier)
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	if opts == nil {
+		opts = []catalog.CreateViewOpt{}
+	}
+	cfg := catalog.NewCreateViewCfg()
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 
 	freshSchema, err := iceberg.AssignFreshSchemaIDs(schema, nil)
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	// Shallow copy for overriding certain attrs
+	newVersion := *version
+	version = &newVersion
+
+	// Enforce starting ID of 1
+	version.VersionID = 1
+
+	// Set default catalog unless set by caller
+	if len(version.DefaultCatalog) == 0 {
+		version.DefaultCatalog = r.name
 	}
 
 	payload := createViewRequest{
-		Name:   view,
-		Schema: freshSchema,
-		SQL:    sql,
-		Props:  props,
-		ViewVersion: viewVersion{
-			VersionID:   1,
-			TimestampMs: time.Now().UnixMilli(),
-			SchemaID:    freshSchema.ID,
-			Summary:     map[string]string{"sql": sql},
-			Representations: []struct {
-				Type    string `json:"type"`
-				SQL     string `json:"sql"`
-				Dialect string `json:"dialect"`
-			}{
-				{Type: "sql", SQL: sql, Dialect: "default"},
-			},
-			DefaultCatalog:   r.name,
-			DefaultNamespace: strings.Split(ns, namespaceSeparator),
-		},
+		Name:        viewName,
+		Location:    cfg.Location,
+		Schema:      freshSchema,
+		Props:       cfg.Properties,
+		ViewVersion: version,
 	}
 
-	_, err = doPost[createViewRequest, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views"}, payload,
+	ret, err := doPost[createViewRequest, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views"}, payload,
 		r.cl, map[int]error{
 			http.StatusNotFound: catalog.ErrNoSuchNamespace,
 			http.StatusConflict: catalog.ErrViewAlreadyExists,
 		})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return view.New(identifier, ret.Metadata, ret.MetadataLoc), nil
+}
+
+// UpdateView updates a view in the catalog.
+func (r *Catalog) UpdateView(ctx context.Context, ident table.Identifier, requirements []view.Requirement, updates []view.Update) (*view.View, error) {
+	ns, viewName, err := splitIdentForPath(ident)
+	if err != nil {
+		return nil, err
+	}
+
+	restIdentifier := identifier{
+		Namespace: catalog.NamespaceFromIdent(ident),
+		Name:      viewName,
+	}
+	type payload struct {
+		Identifier   identifier         `json:"identifier"`
+		Requirements []view.Requirement `json:"requirements"`
+		Updates      []view.Update      `json:"updates"`
+	}
+	ret, err := doPost[payload, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views", viewName},
+		payload{Identifier: restIdentifier, Requirements: requirements, Updates: updates}, r.cl,
+		map[int]error{http.StatusNotFound: catalog.ErrNoSuchView, http.StatusConflict: ErrCommitFailed})
+	if err != nil {
+		return nil, err
+	}
+
+	return view.New(ident, ret.Metadata, ret.MetadataLoc), nil
+}
+
+// loadViewResponse contains the response from loading a view
+type loadViewResponse struct {
+	MetadataLoc string             `json:"metadata-location"`
+	RawMetadata json.RawMessage    `json:"metadata"`
+	Config      iceberg.Properties `json:"config"`
+}
+
+// LoadView loads a view from the catalog.
+func (r *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (*view.View, error) {
+	ns, v, err := splitIdentForPath(identifier)
+	if err != nil {
+		return nil, err
+	}
+
+	rsp, err := doGet[loadViewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views", v},
+		r.cl, map[int]error{
+			http.StatusNotFound: catalog.ErrNoSuchView,
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	metadata, err := view.ParseMetadataBytes(rsp.RawMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse view metadata: %w", err)
+	}
+
+	return view.New(identifier, metadata, rsp.MetadataLoc), nil
 }

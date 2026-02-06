@@ -113,7 +113,7 @@ func (u *Updates) UnmarshalJSON(data []byte) error {
 		case UpdateRemoveSchemas:
 			upd = &removeSchemasUpdate{}
 		default:
-			return fmt.Errorf("unknown update action: %s", base.ActionName)
+			return fmt.Errorf("%w: unknown update action: %s", iceberg.ErrInvalidArgument, base.ActionName)
 		}
 
 		if err := json.Unmarshal(raw, upd); err != nil {
@@ -153,9 +153,7 @@ func NewAssignUUIDUpdate(uuid uuid.UUID) *assignUUIDUpdate {
 }
 
 func (u *assignUUIDUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetUUID(u.UUID)
-
-	return err
+	return builder.SetUUID(u.UUID)
 }
 
 type upgradeFormatVersionUpdate struct {
@@ -173,9 +171,7 @@ func NewUpgradeFormatVersionUpdate(formatVersion int) *upgradeFormatVersionUpdat
 }
 
 func (u *upgradeFormatVersionUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetFormatVersion(u.FormatVersion)
-
-	return err
+	return builder.SetFormatVersion(u.FormatVersion)
 }
 
 type addSchemaUpdate struct {
@@ -193,9 +189,7 @@ func NewAddSchemaUpdate(schema *iceberg.Schema) *addSchemaUpdate {
 }
 
 func (u *addSchemaUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.AddSchema(u.Schema)
-
-	return err
+	return builder.AddSchema(u.Schema)
 }
 
 type setCurrentSchemaUpdate struct {
@@ -213,9 +207,7 @@ func NewSetCurrentSchemaUpdate(id int) *setCurrentSchemaUpdate {
 }
 
 func (u *setCurrentSchemaUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetCurrentSchemaID(u.SchemaID)
-
-	return err
+	return builder.SetCurrentSchemaID(u.SchemaID)
 }
 
 type addPartitionSpecUpdate struct {
@@ -236,9 +228,7 @@ func NewAddPartitionSpecUpdate(spec *iceberg.PartitionSpec, initial bool) *addPa
 }
 
 func (u *addPartitionSpecUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.AddPartitionSpec(u.Spec, u.initial)
-
-	return err
+	return builder.AddPartitionSpec(u.Spec, u.initial)
 }
 
 type setDefaultSpecUpdate struct {
@@ -256,9 +246,7 @@ func NewSetDefaultSpecUpdate(id int) *setDefaultSpecUpdate {
 }
 
 func (u *setDefaultSpecUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetDefaultSpecID(u.SpecID)
-
-	return err
+	return builder.SetDefaultSpecID(u.SpecID)
 }
 
 type addSortOrderUpdate struct {
@@ -270,18 +258,15 @@ type addSortOrderUpdate struct {
 // NewAddSortOrderUpdate creates a new update that adds the given sort order to the table metadata.
 // If the initial flag is set to true, the sort order is considered the initial sort order of the table,
 // and all previously added sort orders in the metadata builder are removed.
-func NewAddSortOrderUpdate(sortOrder *SortOrder, initial bool) *addSortOrderUpdate {
+func NewAddSortOrderUpdate(sortOrder *SortOrder) *addSortOrderUpdate {
 	return &addSortOrderUpdate{
 		baseUpdate: baseUpdate{ActionName: UpdateAddSortOrder},
 		SortOrder:  sortOrder,
-		initial:    initial,
 	}
 }
 
 func (u *addSortOrderUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.AddSortOrder(u.SortOrder, u.initial)
-
-	return err
+	return builder.AddSortOrder(u.SortOrder)
 }
 
 type setDefaultSortOrderUpdate struct {
@@ -299,9 +284,7 @@ func NewSetDefaultSortOrderUpdate(id int) *setDefaultSortOrderUpdate {
 }
 
 func (u *setDefaultSortOrderUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetDefaultSortOrderID(u.SortOrderID)
-
-	return err
+	return builder.SetDefaultSortOrderID(u.SortOrderID)
 }
 
 type addSnapshotUpdate struct {
@@ -318,9 +301,7 @@ func NewAddSnapshotUpdate(snapshot *Snapshot) *addSnapshotUpdate {
 }
 
 func (u *addSnapshotUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.AddSnapshot(u.Snapshot)
-
-	return err
+	return builder.AddSnapshot(u.Snapshot)
 }
 
 type setSnapshotRefUpdate struct {
@@ -366,14 +347,12 @@ func (u *setSnapshotRefUpdate) Apply(builder *MetadataBuilder) error {
 		opts = append(opts, WithMinSnapshotsToKeep(u.MinSnapshotsToKeep))
 	}
 
-	_, err := builder.SetSnapshotRef(
+	return builder.SetSnapshotRef(
 		u.RefName,
 		u.SnapshotID,
 		u.RefType,
 		opts...,
 	)
-
-	return err
 }
 
 type setLocationUpdate struct {
@@ -390,9 +369,7 @@ func NewSetLocationUpdate(loc string) Update {
 }
 
 func (u *setLocationUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetLoc(u.Location)
-
-	return err
+	return builder.SetLoc(u.Location)
 }
 
 type setPropertiesUpdate struct {
@@ -410,9 +387,7 @@ func NewSetPropertiesUpdate(updates iceberg.Properties) *setPropertiesUpdate {
 }
 
 func (u *setPropertiesUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetProperties(u.Updates)
-
-	return err
+	return builder.SetProperties(u.Updates)
 }
 
 type removePropertiesUpdate struct {
@@ -431,9 +406,7 @@ func NewRemovePropertiesUpdate(removals []string) *removePropertiesUpdate {
 }
 
 func (u *removePropertiesUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.RemoveProperties(u.Removals)
-
-	return err
+	return builder.RemoveProperties(u.Removals)
 }
 
 type removeSnapshotsUpdate struct {
@@ -442,6 +415,7 @@ type removeSnapshotsUpdate struct {
 
 	postCommitRemoveDataFiles     bool
 	postCommitRemoveMetadataFiles bool
+	postCommit  bool
 }
 
 // NewRemoveSnapshotsUpdate creates a new update that removes all snapshots from
@@ -473,6 +447,9 @@ func (u *removeSnapshotsUpdate) Apply(builder *MetadataBuilder) error {
 }
 
 func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table, postTable *Table) error {
+	if !u.postCommit {
+		return nil
+	}
 	if !u.postCommitRemoveDataFiles && !u.postCommitRemoveMetadataFiles {
 		return nil
 	}
@@ -580,19 +557,17 @@ func NewRemoveSnapshotRefUpdate(ref string) *removeSnapshotRefUpdate {
 }
 
 func (u *removeSnapshotRefUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.RemoveSnapshotRef(u.RefName)
-
-	return err
+	return builder.RemoveSnapshotRef(u.RefName)
 }
 
 type removeSpecUpdate struct {
 	baseUpdate
-	SpecIds []int64 `json:"spec-ids"`
+	SpecIds []int `json:"spec-ids"`
 }
 
 // NewRemoveSpecUpdate creates a new Update that removes a list of partition specs
 // from the table metadata.
-func NewRemoveSpecUpdate(specIds []int64) *removeSpecUpdate {
+func NewRemoveSpecUpdate(specIds []int) *removeSpecUpdate {
 	return &removeSpecUpdate{
 		baseUpdate: baseUpdate{ActionName: UpdateRemoveSpec},
 		SpecIds:    specIds,
@@ -600,23 +575,23 @@ func NewRemoveSpecUpdate(specIds []int64) *removeSpecUpdate {
 }
 
 func (u *removeSpecUpdate) Apply(builder *MetadataBuilder) error {
-	return fmt.Errorf("%w: %s", iceberg.ErrNotImplemented, UpdateRemoveSpec)
+	return builder.RemovePartitionSpecs(u.SpecIds)
 }
 
 type removeSchemasUpdate struct {
 	baseUpdate
-	SchemaIds []int64 `json:"schema-ids"`
+	SchemaIDs []int `json:"schema-ids"`
 }
 
 // NewRemoveSchemasUpdate creates a new Update that removes a list of schemas from
 // the table metadata.
-func NewRemoveSchemasUpdate(schemaIds []int64) *removeSchemasUpdate {
+func NewRemoveSchemasUpdate(schemaIds []int) *removeSchemasUpdate {
 	return &removeSchemasUpdate{
 		baseUpdate: baseUpdate{ActionName: UpdateRemoveSchemas},
-		SchemaIds:  schemaIds,
+		SchemaIDs:  schemaIds,
 	}
 }
 
 func (u *removeSchemasUpdate) Apply(builder *MetadataBuilder) error {
-	return fmt.Errorf("%w: %s", iceberg.ErrNotImplemented, UpdateRemoveSchemas)
+	return builder.RemoveSchemas(u.SchemaIDs)
 }

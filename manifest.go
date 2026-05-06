@@ -749,10 +749,10 @@ func (c *ManifestReader) ReadEntry() (ManifestEntry, error) {
 	var tmp ManifestEntry
 	if c.isFallback {
 		tmp = &fallbackManifestEntry{
-			manifestEntry: manifestEntry{Data: &extendedDataFile{}},
+			manifestEntry: manifestEntry{Data: &dataFile{}},
 		}
 	} else {
-		tmp = &manifestEntry{Data: &extendedDataFile{}}
+		tmp = &manifestEntry{Data: &dataFile{}}
 	}
 
 	if err := c.dec.Decode(tmp); err != nil {
@@ -762,7 +762,7 @@ func (c *ManifestReader) ReadEntry() (ManifestEntry, error) {
 		tmp = tmp.(*fallbackManifestEntry).toEntry()
 	}
 	if c.file != nil {
-		tmp.inherit(c.file)
+		tmp.Inherit(c.file)
 	}
 	if fieldToIDMap, ok := tmp.DataFile().(hasFieldToIDMap); ok {
 		fieldToIDMap.setFieldNameToIDMap(c.fieldNameToID)
@@ -1229,7 +1229,7 @@ func (w *ManifestWriter) addEntry(entry *manifestEntry) error {
 	w.partitions = append(w.partitions, entry.Data.Partition())
 	partitionData := avroPartitionData(entry.Data.Partition(), w.partFieldIDToType)
 
-	if dataFile, ok := entry.DataFile().(*extendedDataFile); ok {
+	if df, ok := entry.DataFile().(*dataFile); ok {
 		convertedPartitionData := make(map[string]any)
 		for fieldID, convertedValue := range partitionData {
 			for fieldName, id := range w.partFieldNameToID {
@@ -1240,7 +1240,7 @@ func (w *ManifestWriter) addEntry(entry *manifestEntry) error {
 				}
 			}
 		}
-		dataFile.PartitionData = convertedPartitionData
+		df.PartitionData = convertedPartitionData
 	}
 
 	if (entry.Status() == EntryStatusADDED || entry.Status() == EntryStatusEXISTING) &&
@@ -1695,7 +1695,7 @@ func convertToFixedArray(bytes []byte, size int) any {
 	return arr.Interface()
 }
 
-type dataFileImm struct {
+type dataFile struct {
 	Content                 ManifestEntryContent   `avro:"content"`
 	Path                    string                 `avro:"file_path"`
 	Format                  FileFormat             `avro:"file_format"`
@@ -1733,28 +1733,11 @@ type dataFileImm struct {
 	fieldIDToPartitionData map[int]any
 	fieldIDToFixedSize     map[int]int
 
+	specID   int32
 	initMaps sync.Once
 }
 
-type extendedDataFile struct {
-	*dataFileImm
-	specID int32
-}
-
-func (e extendedDataFile) MarshalAvro() ([]byte, error) {
-	return avro.Marshal(nil, e.dataFileImm)
-}
-
-func (e *extendedDataFile) UnmarshalAvro(data []byte) error {
-	var inner dataFileImm
-	if err := avro.Unmarshal(nil, data, &inner); err != nil {
-		return err
-	}
-	e.dataFileImm = &inner
-	return nil
-}
-
-func (d *dataFileImm) initializeMapData() {
+func (d *dataFile) initializeMapData() {
 	d.initMaps.Do(func() {
 		d.colSizeMap = avroColMapToMap(d.ColSizes)
 		d.valCntMap = avroColMapToMap(d.ValCounts)
@@ -1776,7 +1759,7 @@ func (d *dataFileImm) initializeMapData() {
 	})
 }
 
-func (d *dataFileImm) convertAvroValueToIcebergType(v any, fieldID int) any {
+func (d *dataFile) convertAvroValueToIcebergType(v any, fieldID int) any {
 	if logicalType, ok := d.fieldIDToLogicalType[fieldID]; ok {
 		switch logicalType {
 		case avro.Date:
@@ -1844,76 +1827,70 @@ func (d *dataFileImm) convertAvroValueToIcebergType(v any, fieldID int) any {
 	return v
 }
 
-func (d *dataFileImm) setFieldNameToIDMap(m map[string]int) { d.fieldNameToID = m }
-func (d *dataFileImm) setFieldIDToLogicalTypeMap(m map[int]avro.LogicalType) {
+func (d *dataFile) setFieldNameToIDMap(m map[string]int) { d.fieldNameToID = m }
+func (d *dataFile) setFieldIDToLogicalTypeMap(m map[int]avro.LogicalType) {
 	d.fieldIDToLogicalType = m
 }
-func (d *dataFileImm) setFieldIDToFixedSizeMap(m map[int]int) { d.fieldIDToFixedSize = m }
+func (d *dataFile) setFieldIDToFixedSizeMap(m map[int]int) { d.fieldIDToFixedSize = m }
 
-func (d *dataFileImm) ContentType() ManifestEntryContent { return d.Content }
-func (d *dataFileImm) FilePath() string                  { return d.Path }
-func (d *dataFileImm) FileFormat() FileFormat            { return d.Format }
+func (d *dataFile) ContentType() ManifestEntryContent { return d.Content }
+func (d *dataFile) FilePath() string                  { return d.Path }
+func (d *dataFile) FileFormat() FileFormat            { return d.Format }
 
 // Partition returns the partition data as a map of partition field ID to value.
-func (d *dataFileImm) Partition() map[int]any {
+func (d *dataFile) Partition() map[int]any {
 	d.initializeMapData()
 
 	return d.fieldIDToPartitionData
 }
 
-func (d *dataFileImm) Count() int64         { return d.RecordCount }
-func (d *dataFileImm) FileSizeBytes() int64 { return d.FileSize }
-func (d extendedDataFile) SpecID() int32    { return d.specID }
-func (d extendedDataFile) WithSpecID(id int32) DataFile {
-	return &extendedDataFile{
-		dataFileImm: d.dataFileImm,
-		specID:      id,
-	}
-}
+func (d *dataFile) Count() int64         { return d.RecordCount }
+func (d *dataFile) FileSizeBytes() int64 { return d.FileSize }
+func (d *dataFile) SpecID() int32        { return d.specID }
 
-func (d *dataFileImm) ColumnSizes() map[int]int64 {
+func (d *dataFile) ColumnSizes() map[int]int64 {
 	d.initializeMapData()
 
 	return d.colSizeMap
 }
 
-func (d *dataFileImm) ValueCounts() map[int]int64 {
+func (d *dataFile) ValueCounts() map[int]int64 {
 	d.initializeMapData()
 
 	return d.valCntMap
 }
 
-func (d *dataFileImm) NullValueCounts() map[int]int64 {
+func (d *dataFile) NullValueCounts() map[int]int64 {
 	d.initializeMapData()
 
 	return d.nullCntMap
 }
 
-func (d *dataFileImm) NaNValueCounts() map[int]int64 {
+func (d *dataFile) NaNValueCounts() map[int]int64 {
 	d.initializeMapData()
 
 	return d.nanCntMap
 }
 
-func (d *dataFileImm) DistinctValueCounts() map[int]int64 {
+func (d *dataFile) DistinctValueCounts() map[int]int64 {
 	d.initializeMapData()
 
 	return d.distinctCntMap
 }
 
-func (d *dataFileImm) LowerBoundValues() map[int][]byte {
+func (d *dataFile) LowerBoundValues() map[int][]byte {
 	d.initializeMapData()
 
 	return d.lowerBoundMap
 }
 
-func (d *dataFileImm) UpperBoundValues() map[int][]byte {
+func (d *dataFile) UpperBoundValues() map[int][]byte {
 	d.initializeMapData()
 
 	return d.upperBoundMap
 }
 
-func (d *dataFileImm) KeyMetadata() []byte {
+func (d *dataFile) KeyMetadata() []byte {
 	if d.Key == nil {
 		return nil
 	}
@@ -1921,7 +1898,7 @@ func (d *dataFileImm) KeyMetadata() []byte {
 	return *d.Key
 }
 
-func (d *dataFileImm) SplitOffsets() []int64 {
+func (d *dataFile) SplitOffsets() []int64 {
 	if d.Splits == nil {
 		return nil
 	}
@@ -1929,7 +1906,7 @@ func (d *dataFileImm) SplitOffsets() []int64 {
 	return *d.Splits
 }
 
-func (d *dataFileImm) EqualityFieldIDs() []int {
+func (d *dataFile) EqualityFieldIDs() []int {
 	if d.EqualityIDs == nil {
 		return nil
 	}
@@ -1937,12 +1914,12 @@ func (d *dataFileImm) EqualityFieldIDs() []int {
 	return *d.EqualityIDs
 }
 
-func (d *dataFileImm) SortOrderID() *int { return d.SortOrder }
+func (d *dataFile) SortOrderID() *int { return d.SortOrder }
 
-func (d *dataFileImm) FirstRowID() *int64          { return d.FirstRowIDField }
-func (d *dataFileImm) ReferencedDataFile() *string { return d.ReferencedDataFileField }
-func (d *dataFileImm) ContentSizeInBytes() *int64  { return d.ContentSizeInBytesField }
-func (d *dataFileImm) ContentOffset() *int64       { return d.ContentOffsetField }
+func (d *dataFile) FirstRowID() *int64          { return d.FirstRowIDField }
+func (d *dataFile) ReferencedDataFile() *string { return d.ReferencedDataFileField }
+func (d *dataFile) ContentSizeInBytes() *int64  { return d.ContentSizeInBytesField }
+func (d *dataFile) ContentOffset() *int64       { return d.ContentOffsetField }
 
 type ManifestEntryBuilder struct {
 	m *manifestEntry
@@ -2005,13 +1982,7 @@ func (m *manifestEntry) FileSequenceNum() *int64 {
 
 func (m *manifestEntry) DataFile() DataFile { return m.Data }
 
-func (m *manifestEntry) WithManifest(manifest ManifestFile) ManifestEntry {
-	copy := *m
-	copy.inherit(manifest)
-	return &copy
-}
-
-func (m *manifestEntry) inherit(manifest ManifestFile) {
+func (m *manifestEntry) Inherit(manifest ManifestFile) {
 	if m.Snapshot == nil {
 		snap := manifest.SnapshotID()
 		m.Snapshot = &snap
@@ -2028,7 +1999,7 @@ func (m *manifestEntry) inherit(manifest ManifestFile) {
 		}
 	}
 
-	m.Data = m.Data.WithSpecID(manifest.PartitionSpecID())
+	m.Data.(*dataFile).specID = manifest.PartitionSpecID()
 }
 
 func (m *manifestEntry) wrap(status ManifestEntryStatus, newSnapID, newSeq, newFileSeq *int64, data DataFile) ManifestEntry {
@@ -2069,7 +2040,7 @@ func NewManifestEntry(status ManifestEntryStatus, snapshotID *int64, seqNum, fil
 // DataFileBuilder is a helper for building a data file struct which will
 // conform to the DataFile interface.
 type DataFileBuilder struct {
-	d extendedDataFile
+	d *dataFile
 }
 
 // NewDataFileBuilder is passed all of the required fields and then allows
@@ -2121,20 +2092,18 @@ func NewDataFileBuilder(
 	}
 
 	return &DataFileBuilder{
-		d: extendedDataFile{
-			dataFileImm: &dataFileImm{
-				Content:                content,
-				Path:                   path,
-				Format:                 format,
-				PartitionData:          partitionData,
-				RecordCount:            recordCount,
-				FileSize:               fileSize,
-				fieldIDToPartitionData: fieldIDToPartitionData,
-				fieldNameToID:          fieldNameToID,
-				fieldIDToLogicalType:   fieldIDToLogicalType,
-				fieldIDToFixedSize:     fieldIDToFixedSize,
-			},
-			specID: int32(spec.id),
+		d: &dataFile{
+			Content:                content,
+			Path:                   path,
+			Format:                 format,
+			PartitionData:          partitionData,
+			RecordCount:            recordCount,
+			FileSize:               fileSize,
+			specID:                 int32(spec.id),
+			fieldIDToPartitionData: fieldIDToPartitionData,
+			fieldNameToID:          fieldNameToID,
+			fieldIDToLogicalType:   fieldIDToLogicalType,
+			fieldIDToFixedSize:     fieldIDToFixedSize,
 		},
 	}, nil
 }
@@ -2248,7 +2217,7 @@ func (b *DataFileBuilder) ContentSizeInBytes(size int64) *DataFileBuilder {
 }
 
 func (b *DataFileBuilder) Build() DataFile {
-	return &b.d
+	return b.d
 }
 
 // DataFile is the interface for reading the information about a
@@ -2313,7 +2282,6 @@ type DataFile interface {
 	// SpecID returns the partition spec id for this data file, inherited
 	// from the manifest that the data file was read from
 	SpecID() int32
-	WithSpecID(id int32) DataFile
 	// FirstRowID returns the first row ID for this data file ( v3+ only )
 	FirstRowID() *int64
 	// ReferencedDataFile returns the location of the data file that deletion vector reference
@@ -2344,9 +2312,7 @@ type ManifestEntry interface {
 	// by this manifest entry.
 	DataFile() DataFile
 
-	WithManifest(manifest ManifestFile) ManifestEntry
-
-	inherit(manifest ManifestFile)
+	Inherit(manifest ManifestFile)
 
 	wrap(status ManifestEntryStatus, snapshotID, seqNum, fileSeqNum *int64, datafile DataFile) ManifestEntry
 }

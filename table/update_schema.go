@@ -18,6 +18,7 @@
 package table
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -638,7 +639,7 @@ func (u *UpdateSchema) BuildUpdates() ([]Update, []Requirement, error) {
 			)
 		} else {
 			updates = append(updates,
-				NewSetCurrentSchemaUpdate(newSchema.ID),
+				NewSetCurrentSchemaUpdate(existingSchemaID),
 			)
 		}
 
@@ -651,8 +652,12 @@ func (u *UpdateSchema) BuildUpdates() ([]Update, []Requirement, error) {
 			if err != nil {
 				return nil, nil, err
 			}
+			mappingJSON, err := json.Marshal(updatedNameMapping)
+			if err != nil {
+				return nil, nil, err
+			}
 			updates = append(updates, NewSetPropertiesUpdate(iceberg.Properties{
-				DefaultNameMappingKey: updatedNameMapping.String(),
+				DefaultNameMappingKey: string(mappingJSON),
 			}))
 		}
 	}

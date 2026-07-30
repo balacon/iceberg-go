@@ -163,3 +163,7 @@ func (s *SnapshotSummaryCollector) Ebuild() iceberg.Properties {
 func EupdateSnapshotSummaries(sum Summary, previous iceberg.Properties) (Summary, error) {
 	return updateSnapshotSummaries(sum, previous)
 }
+
+func EcheckSchemaCompat(requested, provided *iceberg.Schema) error {
+	return checkSchemaCompat(requested, provided)
+}

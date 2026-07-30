@@ -22,6 +22,7 @@ import (
 
 	"io"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
@@ -166,4 +167,8 @@ func EupdateSnapshotSummaries(sum Summary, previous iceberg.Properties) (Summary
 
 func EcheckSchemaCompat(requested, provided *iceberg.Schema) error {
 	return checkSchemaCompat(requested, provided)
+}
+
+func EArrowSchemaHasFieldIDs(sc *arrow.Schema) (bool, error) {
+	return VisitArrowSchema(sc, hasIDs{})
 }

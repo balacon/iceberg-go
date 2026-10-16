@@ -254,8 +254,9 @@ func MetadataBuilderFromBase(metadata Metadata, currentFileLocation string) (*Me
 		b.nextRowID = &nextRowID
 	}
 
-	if metadata.CurrentSnapshot() != nil {
-		b.currentSnapshotID = &metadata.CurrentSnapshot().SnapshotID
+	if cur := metadata.CurrentSnapshot(); cur != nil {
+		currentSnapshotID := cur.SnapshotID
+		b.currentSnapshotID = &currentSnapshotID
 	}
 
 	b.refs = maps.Collect(metadata.Refs())

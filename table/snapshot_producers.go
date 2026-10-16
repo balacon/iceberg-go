@@ -712,8 +712,10 @@ func (sp *snapshotProducer) commit() (_ []Update, _ []Requirement, err error) {
 
 	var parentSnapshot *int64
 	if sp.parentSnapshotID > 0 {
-		parentSnapshot = &sp.parentSnapshotID
+		parentSnapshotID := sp.parentSnapshotID
+		parentSnapshot = &parentSnapshotID
 	}
+	schemaID := sp.txn.meta.currentSchemaID
 
 	out, err := sp.io.Create(manifestListFilePath)
 	if err != nil {
@@ -734,7 +736,7 @@ func (sp *snapshotProducer) commit() (_ []Update, _ []Requirement, err error) {
 		SequenceNumber:   nextSequence,
 		ManifestList:     manifestListFilePath,
 		Summary:          &summary,
-		SchemaID:         &sp.txn.meta.currentSchemaID,
+		SchemaID:         &schemaID,
 		TimestampMs:      time.Now().UnixMilli(),
 	}
 

@@ -2075,8 +2075,8 @@ func NewDataFileBuilder(
 		)
 	}
 
-	if recordCount <= 0 {
-		return nil, fmt.Errorf("%w: record count must be greater than 0", ErrInvalidArgument)
+	if recordCount < 0 {
+		return nil, fmt.Errorf("%w: record count must be non-negative", ErrInvalidArgument)
 	}
 
 	if fileSize <= 0 {

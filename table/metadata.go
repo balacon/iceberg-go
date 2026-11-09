@@ -416,10 +416,11 @@ func (b *MetadataBuilder) AddSnapshot(snapshot *Snapshot) error {
 	} else if b.formatVersion == 2 &&
 		snapshot.ParentSnapshotID != nil &&
 		snapshot.SequenceNumber <= *b.lastSequenceNumber {
-		return fmt.Errorf("can't add snapshot with sequence number %d, must be > than last sequence number %d",
-			snapshot.SequenceNumber, *b.lastSequenceNumber)
+		return fmt.Errorf("%w: can't add snapshot with sequence number %d, must be > than last sequence number %d",
+			ErrCommitFailed, snapshot.SequenceNumber, *b.lastSequenceNumber)
 	}
 
+	// A rebuild keeps the timestamp, so these checks are not retryable.
 	if len(b.snapshotLog) > 0 {
 		last := b.snapshotLog[len(b.snapshotLog)-1]
 		if (snapshot.TimestampMs - last.TimestampMs) < -oneMinuteInMs {
@@ -460,8 +461,8 @@ func (b *MetadataBuilder) validateAndUpdateRowLineage(snapshot *Snapshot) error 
 
 	nextRowID := b.currentNextRowID()
 	if *snapshot.FirstRowID < nextRowID {
-		return fmt.Errorf("%w: first-row-id %d is behind table next-row-id %d",
-			ErrInvalidRowLineage, *snapshot.FirstRowID, nextRowID)
+		return fmt.Errorf("%w: %w: first-row-id %d is behind table next-row-id %d",
+			ErrCommitFailed, ErrInvalidRowLineage, *snapshot.FirstRowID, nextRowID)
 	}
 
 	newNextRowID := nextRowID + *snapshot.AddedRows

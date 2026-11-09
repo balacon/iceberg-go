@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"iter"
 	"log"
@@ -36,6 +37,8 @@ import (
 	tblutils "github.com/apache/iceberg-go/table/internal"
 	"golang.org/x/sync/errgroup"
 )
+
+var ErrCommitFailed = errors.New("commit failed, refresh and try again")
 
 type FSysF func(ctx context.Context) (icebergio.IO, error)
 
